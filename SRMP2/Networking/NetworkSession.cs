@@ -282,8 +282,7 @@ public sealed class NetworkSession : IDisposable
             if (!token.IsCancellationRequested)
             {
                 _log($"Client connection failed: {ex}");
-                SetStatus($"Connection failed: {ex.Message}");
-                StopInternal("Connection failed", notify: true);
+                StopInternal($"Connection failed: {ex.Message}", notify: true);
             }
         }
     }
@@ -366,8 +365,7 @@ public sealed class NetworkSession : IDisposable
             case Protocol.MessageKind.Reject:
             {
                 var reason = Protocol.ReadBoundedString(reader, 256);
-                SetStatus($"Rejected: {reason}");
-                StopInternal("Rejected", notify: true);
+                StopInternal($"Rejected: {reason}", notify: true);
                 break;
             }
             case Protocol.MessageKind.PeerJoined:
