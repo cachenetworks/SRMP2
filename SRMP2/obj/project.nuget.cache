@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "dgSpecHash": "/STer1i2Rdo=",
+  "success": true,
+  "projectFilePath": "D:\\Projects\\SRMP2\\SRMP2\\SRMP2\\SRMP2.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\lordp\\.nuget\\packages\\microsoft.windowsdesktop.app.ref\\6.0.36\\microsoft.windowsdesktop.app.ref.6.0.36.nupkg.sha512",
+    "C:\\Users\\lordp\\.nuget\\packages\\microsoft.netcore.app.ref\\6.0.36\\microsoft.netcore.app.ref.6.0.36.nupkg.sha512",
+    "C:\\Users\\lordp\\.nuget\\packages\\microsoft.aspnetcore.app.ref\\6.0.36\\microsoft.aspnetcore.app.ref.6.0.36.nupkg.sha512"
+  ],
+  "logs": []
+}
