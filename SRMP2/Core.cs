@@ -22,6 +22,7 @@ public sealed class Core : MelonMod
     private MultiplayerController _multiplayer;
     private MultiplayerOverlay _overlay;
     private bool _inputWarningShown;
+    private bool _guiFailureShown;
 
     public override void OnInitializeMelon()
     {
@@ -57,7 +58,25 @@ public sealed class Core : MelonMod
 
     public override void OnGUI()
     {
-        _overlay?.Draw();
+        if (_overlay == null || !_overlay.Visible)
+            return;
+
+        try
+        {
+            _overlay.Draw();
+        }
+        catch (Exception ex)
+        {
+            // IL2CPP games can strip Unity IMGUI overloads that aren't used by the
+            // base game. Never let a missing binding throw once per rendered frame.
+            _overlay.Visible = false;
+            if (!_guiFailureShown)
+            {
+                _guiFailureShown = true;
+                LoggerInstance.Error($"SRMP2 overlay disabled because a Unity IMGUI binding is unavailable: {ex}");
+                LoggerInstance.Warning("Networking will continue running; restart after updating SRMP2 to retry the panel.");
+            }
+        }
     }
 
     public override void OnSceneWasInitialized(int buildIndex, string sceneName)
