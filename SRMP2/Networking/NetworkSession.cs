@@ -3,11 +3,9 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Net;
-using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
+using SRMP2.EOS;
 
 namespace SRMP2.Networking;
 
@@ -34,35 +32,42 @@ public sealed class PeerInfo
 
 public sealed class NetworkSession : IDisposable
 {
+    private const byte ControlChannel = 0;
+    private const byte MovementChannel = 1;
+    private const uint ControlMagic = 0x32435453; // "STC2"
+    private const int ControlHeaderBytes = 8;
+    private const int ControlFragmentPayloadBytes = EosNative.MaxP2PPacketSize - ControlHeaderBytes;
+    private const string LobbyAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
     private readonly Action<string> _log;
+    private readonly EosRuntime _eos;
     private readonly ConcurrentQueue<Action> _mainThread = new();
     private readonly ConcurrentDictionary<int, PeerInfo> _peers = new();
-    private readonly ConcurrentDictionary<int, HostConnection> _hostConnections = new();
-    private readonly SemaphoreSlim _clientSendLock = new(1, 1);
-    private readonly SemaphoreSlim _udpSendLock = new(1, 1);
-    private readonly object _stateLock = new();
+    private readonly Dictionary<IntPtr, HostPeer> _hostPeersByUser = new();
+    private readonly Dictionary<int, HostPeer> _hostPeersById = new();
+    private readonly Dictionary<(IntPtr RemoteUser, ushort MessageId), ControlAssembly> _controlAssemblies = new();
 
-    private CancellationTokenSource _cancellation;
-    private TcpListener _listener;
-    private TcpClient _client;
-    private NetworkStream _clientStream;
-    private UdpClient _udp;
-    private IPEndPoint _serverUdpEndpoint;
     private int _nextPlayerId = 1;
+    private ushort _nextControlMessageId;
     private string _localUsername = "Rancher";
-    private float _nextUdpHelloTime;
+    private string _lobbyId = string.Empty;
+    private IntPtr _hostUserId;
+    private bool _sessionReady;
+    private bool _disposed;
 
     public NetworkSession(Action<string> logger)
     {
         _log = logger ?? (_ => { });
+        _eos = new EosRuntime(_log);
     }
 
     public SessionMode Mode { get; private set; } = SessionMode.Offline;
     public string StatusText { get; private set; } = "Offline";
     public int LocalPlayerId { get; private set; }
     public Guid SessionId { get; private set; } = Guid.Empty;
-    public int Port { get; private set; } = Protocol.DefaultPort;
-    public bool IsConnected => Mode == SessionMode.Host || (Mode == SessionMode.Client && LocalPlayerId > 0);
+    public int Port => Protocol.DefaultPort; // retained for API compatibility; EOS P2P does not require this port.
+    public string ServerCode => _lobbyId;
+    public bool IsConnected => _sessionReady;
     public IReadOnlyCollection<PeerInfo> Peers => _peers.Values.OrderBy(x => x.Id).ToArray();
 
     public event Action<PeerInfo> PeerJoined;
@@ -75,6 +80,41 @@ public sealed class NetworkSession : IDisposable
 
     public void Pump()
     {
+        DrainMainThreadQueue();
+
+        try
+        {
+            _eos.Tick();
+        }
+        catch (Exception ex)
+        {
+            _log($"EOS tick failed: {ex.Message}");
+        }
+
+        if (_eos.IsLoggedIn)
+        {
+            var guard = 0;
+            while (guard++ < 256 && _eos.TryReceive(out var remoteUser, out var channel, out var data))
+            {
+                try
+                {
+                    if (channel == ControlChannel)
+                        HandleControlTransport(remoteUser, data);
+                    else if (channel == MovementChannel)
+                        HandleMovementTransport(remoteUser, data);
+                }
+                catch (Exception ex)
+                {
+                    _log($"EOS packet handling failed: {ex.Message}");
+                }
+            }
+        }
+
+        DrainMainThreadQueue();
+    }
+
+    private void DrainMainThreadQueue()
+    {
         while (_mainThread.TryDequeue(out var action))
         {
             try
@@ -86,108 +126,141 @@ public sealed class NetworkSession : IDisposable
                 _log($"Main-thread network callback failed: {ex}");
             }
         }
-
-        if (Mode == SessionMode.Client && LocalPlayerId > 0 && UnityEngine.Time.unscaledTime >= _nextUdpHelloTime)
-        {
-            _nextUdpHelloTime = UnityEngine.Time.unscaledTime + 2f;
-            SendClientUdpHello();
-        }
     }
 
     public bool TryGetPeer(int id, out PeerInfo peer) => _peers.TryGetValue(id, out peer);
 
     public void StartHost(string username, int port)
     {
-        username = Protocol.CleanUsername(username);
-        port = NormalizePort(port);
+        if (_disposed)
+            return;
+
         StopInternal("Restarting session", notify: false);
+        _localUsername = Protocol.CleanUsername(username);
+        Mode = SessionMode.Host;
+        SetStatus("Signing in to EOS...");
 
-        try
+        _eos.EnsureLoggedIn(_localUsername, (success, error) =>
         {
-            var cts = new CancellationTokenSource();
-            var listener = new TcpListener(IPAddress.Any, port);
-            var udp = new UdpClient(new IPEndPoint(IPAddress.Any, port));
-            listener.Start(Protocol.MaxPlayers);
-
-            lock (_stateLock)
+            if (Mode != SessionMode.Host)
+                return;
+            if (!success)
             {
-                _cancellation = cts;
-                _listener = listener;
-                _udp = udp;
-                Mode = SessionMode.Host;
-                Port = port;
-                LocalPlayerId = 1;
-                SessionId = Guid.NewGuid();
-                _nextPlayerId = 1;
-                _localUsername = username;
-                _peers.Clear();
-                _peers[LocalPlayerId] = new PeerInfo(LocalPlayerId, username);
+                FailPendingSession($"EOS login failed: {error}");
+                return;
             }
 
-            SetStatus($"Hosting on TCP/UDP {port}");
-            _ = Task.Run(() => HostAcceptLoop(cts.Token));
-            _ = Task.Run(() => HostUdpLoop(cts.Token));
-        }
-        catch (Exception ex)
+            CreateHostLobby(attempt: 0);
+        });
+    }
+
+    public void JoinCode(string code, string username)
+    {
+        if (_disposed)
+            return;
+
+        code = NormalizeServerCode(code);
+        if (!IsValidServerCode(code))
         {
-            _log($"Could not start host: {ex}");
-            StopInternal("Host failed", notify: true);
-            SetStatus($"Host failed: {ex.Message}");
+            SetStatus("Invalid server code. Expected 7 letters/numbers.");
+            return;
         }
+
+        StopInternal("Restarting session", notify: false);
+        _localUsername = Protocol.CleanUsername(username);
+        _lobbyId = code;
+        Mode = SessionMode.Client;
+        SetStatus($"Signing in to EOS for lobby {code}...");
+
+        _eos.EnsureLoggedIn(_localUsername, (success, error) =>
+        {
+            if (Mode != SessionMode.Client || !string.Equals(_lobbyId, code, StringComparison.Ordinal))
+                return;
+            if (!success)
+            {
+                FailPendingSession($"EOS login failed: {error}");
+                return;
+            }
+
+            SetStatus($"Joining EOS lobby {code}...");
+            _eos.JoinLobby(code, (result, actualLobbyId) =>
+            {
+                if (Mode != SessionMode.Client)
+                    return;
+                if (result != EosNative.Result.Success)
+                {
+                    FailPendingSession($"EOS lobby join failed: {result}");
+                    return;
+                }
+
+                _lobbyId = string.IsNullOrWhiteSpace(actualLobbyId) ? code : actualLobbyId;
+                if (!_eos.TryGetLobbyOwner(_lobbyId, out _hostUserId) || _hostUserId == IntPtr.Zero)
+                {
+                    FailPendingSession("EOS joined the lobby but could not resolve its owner.");
+                    return;
+                }
+
+                _eos.RegisterP2PCallbacks(OnP2PConnectionRequest, OnP2PConnectionClosed);
+                var accept = _eos.AcceptConnection(_hostUserId);
+                if (accept != EosNative.Result.Success)
+                    _log($"EOS client AcceptConnection returned {accept}; initial SendPacket will still request the connection.");
+
+                var hello = Protocol.BuildTcpFrame(Protocol.MessageKind.Hello, writer =>
+                {
+                    writer.Write(Protocol.Version);
+                    writer.Write(BuildInfo.Version);
+                    writer.Write(_localUsername);
+                });
+
+                if (!SendControl(_hostUserId, hello, disableAutoAccept: false))
+                {
+                    FailPendingSession("EOS could not send the initial handshake to the host.");
+                    return;
+                }
+
+                SetStatus($"Connecting to EOS host for {_lobbyId}...");
+            });
+        });
     }
 
     public void Join(string host, int port, string username)
     {
-        if (string.IsNullOrWhiteSpace(host))
-            host = "127.0.0.1";
-
-        username = Protocol.CleanUsername(username);
-        port = NormalizePort(port);
-        StopInternal("Restarting session", notify: false);
-
-        var cts = new CancellationTokenSource();
-        lock (_stateLock)
-        {
-            _cancellation = cts;
-            Mode = SessionMode.Client;
-            Port = port;
-            LocalPlayerId = 0;
-            SessionId = Guid.Empty;
-            _localUsername = username;
-            _peers.Clear();
-        }
-
-        SetStatus($"Connecting to {host}:{port}...");
-        _ = Task.Run(() => ConnectClient(host, port, username, cts.Token));
+        // Kept for source compatibility with earlier SRMP2 builds. The Internet
+        // transport is now EOS lobby/P2P, so the first argument is treated as a code.
+        JoinCode(host, username);
     }
 
-    public void Disconnect() => StopInternal("Disconnected", notify: true);
+    public void Disconnect()
+    {
+        if (Mode == SessionMode.Client && _sessionReady && _hostUserId != IntPtr.Zero)
+            SendControl(_hostUserId, Protocol.BuildTcpFrame(Protocol.MessageKind.Disconnect));
+        else if (Mode == SessionMode.Host && _sessionReady)
+            BroadcastControl(Protocol.BuildTcpFrame(Protocol.MessageKind.Disconnect));
+
+        StopInternal("Disconnected", notify: true);
+    }
 
     public void SendSnapshot(PlayerSnapshot snapshot)
     {
-        if (!IsConnected || snapshot.PlayerId != LocalPlayerId || SessionId == Guid.Empty)
+        if (!_sessionReady || snapshot.PlayerId != LocalPlayerId || SessionId == Guid.Empty)
             return;
 
         var bytes = Protocol.BuildSnapshot(SessionId, snapshot);
         if (Mode == SessionMode.Host)
         {
-            foreach (var connection in _hostConnections.Values)
-            {
-                var endpoint = connection.UdpEndpoint;
-                if (endpoint != null)
-                    _ = SendUdp(bytes, endpoint);
-            }
+            foreach (var peer in _hostPeersById.Values.ToArray())
+                SendMovement(peer.ProductUserId, bytes);
         }
-        else if (_serverUdpEndpoint != null)
+        else if (Mode == SessionMode.Client && _hostUserId != IntPtr.Zero)
         {
-            _ = SendUdp(bytes, _serverUdpEndpoint);
+            SendMovement(_hostUserId, bytes);
         }
     }
 
     public void SendChat(string text)
     {
         text = Protocol.CleanChat(text);
-        if (text.Length == 0 || !IsConnected)
+        if (text.Length == 0 || !_sessionReady)
             return;
 
         if (Mode == SessionMode.Host)
@@ -198,17 +271,17 @@ public sealed class NetworkSession : IDisposable
                 writer.Write(LocalPlayerId);
                 writer.Write(text);
             });
-            Broadcast(frame);
+            BroadcastControl(frame);
         }
-        else
+        else if (_hostUserId != IntPtr.Zero)
         {
-            SendClientFrame(Protocol.BuildTcpFrame(Protocol.MessageKind.Chat, writer => writer.Write(text)));
+            SendControl(_hostUserId, Protocol.BuildTcpFrame(Protocol.MessageKind.Chat, writer => writer.Write(text)));
         }
     }
 
     public void SendScene(string sceneName)
     {
-        if (!IsConnected)
+        if (!_sessionReady)
             return;
 
         sceneName ??= string.Empty;
@@ -225,97 +298,233 @@ public sealed class NetworkSession : IDisposable
                 writer.Write(LocalPlayerId);
                 writer.Write(sceneName);
             });
-            Broadcast(frame);
+            BroadcastControl(frame);
         }
-        else
+        else if (_hostUserId != IntPtr.Zero)
         {
-            SendClientFrame(Protocol.BuildTcpFrame(Protocol.MessageKind.SceneChanged, writer => writer.Write(sceneName)));
+            SendControl(_hostUserId, Protocol.BuildTcpFrame(Protocol.MessageKind.SceneChanged, writer => writer.Write(sceneName)));
         }
     }
 
-    private async Task ConnectClient(string host, int port, string username, CancellationToken token)
+    private void CreateHostLobby(int attempt)
     {
-        try
+        if (Mode != SessionMode.Host)
+            return;
+        if (attempt >= 5)
         {
-            var client = new TcpClient { NoDelay = true };
-            await client.ConnectAsync(host, port).ConfigureAwait(false);
-            if (token.IsCancellationRequested)
+            FailPendingSession("EOS could not allocate a unique server code after 5 attempts.");
+            return;
+        }
+
+        var code = GenerateServerCode();
+        SetStatus($"Creating EOS lobby {code}...");
+        _eos.CreateLobby(code, (result, actualLobbyId) =>
+        {
+            if (Mode != SessionMode.Host)
+                return;
+
+            if (result == EosNative.Result.DuplicateNotAllowed)
             {
-                client.Close();
+                CreateHostLobby(attempt + 1);
+                return;
+            }
+            if (result != EosNative.Result.Success)
+            {
+                FailPendingSession($"EOS lobby creation failed: {result}");
                 return;
             }
 
-            var stream = client.GetStream();
-            var remote = (IPEndPoint)client.Client.RemoteEndPoint;
-            var udp = new UdpClient(0);
+            _lobbyId = string.IsNullOrWhiteSpace(actualLobbyId) ? code : actualLobbyId;
+            SessionId = Guid.NewGuid();
+            LocalPlayerId = 1;
+            _nextPlayerId = 1;
+            _peers.Clear();
+            _peers[LocalPlayerId] = new PeerInfo(LocalPlayerId, _localUsername);
+            _hostPeersById.Clear();
+            _hostPeersByUser.Clear();
+            _sessionReady = true;
+            _eos.RegisterP2PCallbacks(OnP2PConnectionRequest, OnP2PConnectionClosed);
+            SetStatus($"Hosting EOS lobby {_lobbyId}");
+            _log($"EOS SRMP2 lobby ready. Server code: {_lobbyId}");
+        });
+    }
 
-            lock (_stateLock)
-            {
-                if (token.IsCancellationRequested)
-                {
-                    client.Close();
-                    udp.Close();
-                    return;
-                }
-                _client = client;
-                _clientStream = stream;
-                _udp = udp;
-                _serverUdpEndpoint = new IPEndPoint(remote.Address, port);
-            }
+    private void OnP2PConnectionRequest(IntPtr remoteUserId)
+    {
+        if (remoteUserId == IntPtr.Zero)
+            return;
 
-            var hello = Protocol.BuildTcpFrame(Protocol.MessageKind.Hello, writer =>
-            {
-                writer.Write(Protocol.Version);
-                writer.Write(SRMP2.BuildInfo.Version);
-                writer.Write(username);
-            });
-            await SendFrame(stream, _clientSendLock, hello, token).ConfigureAwait(false);
-
-            _ = Task.Run(() => ClientUdpLoop(token));
-            await ClientReadLoop(stream, token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
+        if (Mode == SessionMode.Host)
         {
-        }
-        catch (Exception ex)
-        {
-            if (!token.IsCancellationRequested)
+            if (!_sessionReady || !_eos.IsLobbyMember(_lobbyId, remoteUserId))
             {
-                _log($"Client connection failed: {ex}");
-                StopInternal($"Connection failed: {ex.Message}", notify: true);
+                _eos.CloseConnection(remoteUserId);
+                return;
             }
+        }
+        else if (Mode == SessionMode.Client && remoteUserId != _hostUserId)
+        {
+            _eos.CloseConnection(remoteUserId);
+            return;
+        }
+
+        var result = _eos.AcceptConnection(remoteUserId);
+        if (result != EosNative.Result.Success)
+            _log($"EOS AcceptConnection failed: {result}");
+    }
+
+    private void OnP2PConnectionClosed(IntPtr remoteUserId, int reason)
+    {
+        if (Mode == SessionMode.Host)
+        {
+            if (_hostPeersByUser.TryGetValue(remoteUserId, out var peer))
+                RemoveHostPeer(peer.Id, closeConnection: false);
+        }
+        else if (Mode == SessionMode.Client && remoteUserId == _hostUserId && _sessionReady)
+        {
+            _log($"EOS host connection closed (reason {reason}).");
+            StopInternal("EOS host connection closed", notify: true);
         }
     }
 
-    private async Task ClientReadLoop(NetworkStream stream, CancellationToken token)
+    private void HandleControlTransport(IntPtr remoteUserId, byte[] packet)
+    {
+        if (!TryReassembleControl(remoteUserId, packet, out var frame))
+            return;
+
+        if (Mode == SessionMode.Host)
+            HandleHostControl(remoteUserId, frame);
+        else if (Mode == SessionMode.Client && remoteUserId == _hostUserId)
+            HandleClientControl(frame);
+    }
+
+    private void HandleHostControl(IntPtr remoteUserId, byte[] frame)
+    {
+        if (frame == null || frame.Length == 0)
+            return;
+
+        using var stream = new MemoryStream(frame, writable: false);
+        using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
+        var kind = (Protocol.MessageKind)reader.ReadByte();
+
+        if (!_hostPeersByUser.TryGetValue(remoteUserId, out var connection))
+        {
+            if (kind != Protocol.MessageKind.Hello)
+                return;
+            HandleHostHello(remoteUserId, reader);
+            return;
+        }
+
+        switch (kind)
+        {
+            case Protocol.MessageKind.Chat:
+            {
+                var text = Protocol.CleanChat(Protocol.ReadBoundedString(reader, Protocol.MaxChatLength));
+                if (text.Length == 0)
+                    return;
+                Enqueue(() => ChatReceived?.Invoke(connection.Id, text));
+                var outgoing = Protocol.BuildTcpFrame(Protocol.MessageKind.Chat, writer =>
+                {
+                    writer.Write(connection.Id);
+                    writer.Write(text);
+                });
+                BroadcastControl(outgoing);
+                break;
+            }
+            case Protocol.MessageKind.SceneChanged:
+            {
+                var scene = Protocol.ReadBoundedString(reader, Protocol.MaxSceneLength);
+                if (_peers.TryGetValue(connection.Id, out var peer))
+                    peer.SceneName = scene;
+                Enqueue(() => SceneChanged?.Invoke(connection.Id, scene));
+                var outgoing = Protocol.BuildTcpFrame(Protocol.MessageKind.SceneChanged, writer =>
+                {
+                    writer.Write(connection.Id);
+                    writer.Write(scene);
+                });
+                BroadcastControl(outgoing, exceptPlayerId: connection.Id);
+                break;
+            }
+            case Protocol.MessageKind.Ping:
+                SendControl(remoteUserId, Protocol.BuildTcpFrame(Protocol.MessageKind.Pong));
+                break;
+            case Protocol.MessageKind.Disconnect:
+                RemoveHostPeer(connection.Id, closeConnection: true);
+                break;
+        }
+    }
+
+    private void HandleHostHello(IntPtr remoteUserId, BinaryReader reader)
     {
         try
         {
-            while (!token.IsCancellationRequested)
+            var protocol = reader.ReadInt32();
+            var modVersion = Protocol.ReadBoundedString(reader, 64);
+            var username = Protocol.CleanUsername(Protocol.ReadBoundedString(reader, Protocol.MaxUsernameLength));
+
+            if (protocol != Protocol.Version)
             {
-                var frame = await ReadFrame(stream, token).ConfigureAwait(false);
-                if (frame == null)
-                    break;
-                HandleClientFrame(frame);
+                SendReject(remoteUserId, $"Protocol mismatch. Host={Protocol.Version}, client={protocol}");
+                return;
             }
-        }
-        catch (OperationCanceledException)
-        {
+            if (!string.Equals(modVersion, BuildInfo.Version, StringComparison.Ordinal))
+            {
+                SendReject(remoteUserId, $"SRMP2 version mismatch. Host={BuildInfo.Version}, client={modVersion}");
+                return;
+            }
+            if (!_eos.IsLobbyMember(_lobbyId, remoteUserId))
+            {
+                SendReject(remoteUserId, "EOS user is not a member of this lobby.");
+                _eos.CloseConnection(remoteUserId);
+                return;
+            }
+            if (_hostPeersById.Count + 1 >= Protocol.MaxPlayers)
+            {
+                SendReject(remoteUserId, "Server is full.");
+                return;
+            }
+
+            var id = ++_nextPlayerId;
+            var peer = new PeerInfo(id, username);
+            var connection = new HostPeer(id, username, modVersion, remoteUserId);
+            _hostPeersById[id] = connection;
+            _hostPeersByUser[remoteUserId] = connection;
+            _peers[id] = peer;
+
+            var peerSnapshot = _peers.Values.OrderBy(x => x.Id).ToArray();
+            var welcome = Protocol.BuildTcpFrame(Protocol.MessageKind.Welcome, writer =>
+            {
+                writer.Write(Protocol.Version);
+                writer.Write(id);
+                writer.Write(SessionId.ToByteArray());
+                writer.Write(peerSnapshot.Length);
+                foreach (var existing in peerSnapshot)
+                {
+                    writer.Write(existing.Id);
+                    writer.Write(existing.Username);
+                    writer.Write(existing.SceneName ?? string.Empty);
+                }
+            });
+            SendControl(remoteUserId, welcome);
+
+            var joined = Protocol.BuildTcpFrame(Protocol.MessageKind.PeerJoined, writer =>
+            {
+                writer.Write(id);
+                writer.Write(username);
+                writer.Write(peer.SceneName ?? string.Empty);
+            });
+            BroadcastControl(joined, exceptPlayerId: id);
+            Enqueue(() => PeerJoined?.Invoke(peer));
+            _log($"{username} (#{id}) connected over EOS P2P using SRMP2 {modVersion}.");
         }
         catch (Exception ex)
         {
-            if (!token.IsCancellationRequested)
-                _log($"Client receive loop ended: {ex}");
-        }
-
-        if (!token.IsCancellationRequested && Mode == SessionMode.Client)
-        {
-            SetStatus("Connection closed");
-            StopInternal("Connection closed", notify: true);
+            _log($"Rejected malformed EOS hello: {ex.Message}");
+            SendReject(remoteUserId, "Malformed handshake.");
         }
     }
 
-    private void HandleClientFrame(byte[] frame)
+    private void HandleClientControl(byte[] frame)
     {
         using var stream = new MemoryStream(frame, writable: false);
         using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
@@ -330,7 +539,10 @@ public sealed class NetworkSession : IDisposable
                     throw new InvalidDataException($"Protocol mismatch. Server={protocol}, client={Protocol.Version}");
 
                 var assignedId = reader.ReadInt32();
-                var session = new Guid(reader.ReadBytes(16));
+                var sessionBytes = reader.ReadBytes(16);
+                if (sessionBytes.Length != 16)
+                    throw new InvalidDataException("Invalid EOS welcome session id.");
+                var session = new Guid(sessionBytes);
                 var peerCount = reader.ReadInt32();
                 if (peerCount < 1 || peerCount > Protocol.MaxPlayers)
                     throw new InvalidDataException("Invalid peer count.");
@@ -349,8 +561,9 @@ public sealed class NetworkSession : IDisposable
                 _peers.Clear();
                 foreach (var peer in receivedPeers)
                     _peers[peer.Id] = peer;
+                _sessionReady = true;
 
-                SetStatus($"Connected as {_localUsername} (#{assignedId})");
+                SetStatus($"Connected via EOS as {_localUsername} (#{assignedId})");
                 Enqueue(() =>
                 {
                     foreach (var peer in receivedPeers)
@@ -359,7 +572,6 @@ public sealed class NetworkSession : IDisposable
                             PeerJoined?.Invoke(peer);
                     }
                 });
-                SendClientUdpHello();
                 break;
             }
             case Protocol.MessageKind.Reject:
@@ -402,478 +614,243 @@ public sealed class NetworkSession : IDisposable
                 break;
             }
             case Protocol.MessageKind.Ping:
-                SendClientFrame(Protocol.BuildTcpFrame(Protocol.MessageKind.Pong));
+                SendControl(_hostUserId, Protocol.BuildTcpFrame(Protocol.MessageKind.Pong));
                 break;
             case Protocol.MessageKind.Disconnect:
-                SetStatus("Server closed the session");
-                StopInternal("Server closed", notify: true);
+                StopInternal("Server closed the EOS session", notify: true);
                 break;
         }
     }
 
-    private async Task HostAcceptLoop(CancellationToken token)
+    private void HandleMovementTransport(IntPtr remoteUserId, byte[] bytes)
     {
-        while (!token.IsCancellationRequested)
-        {
-            try
-            {
-                var client = await _listener.AcceptTcpClientAsync().ConfigureAwait(false);
-                client.NoDelay = true;
-                _ = Task.Run(() => AcceptHostPeer(client, token));
-            }
-            catch (ObjectDisposedException)
-            {
-                break;
-            }
-            catch (SocketException) when (token.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                if (!token.IsCancellationRequested)
-                    _log($"Accept failed: {ex}");
-            }
-        }
-    }
+        if (!_sessionReady || !Protocol.TryReadUdp(bytes, out var packet))
+            return;
+        if (packet.Kind != Protocol.UdpKind.PlayerSnapshot || packet.SessionId != SessionId)
+            return;
 
-    private async Task AcceptHostPeer(TcpClient client, CancellationToken token)
-    {
-        HostConnection connection = null;
-        try
+        if (Mode == SessionMode.Host)
         {
-            var stream = client.GetStream();
-            var helloFrame = await ReadFrame(stream, token).ConfigureAwait(false);
-            if (helloFrame == null)
+            if (!_hostPeersByUser.TryGetValue(remoteUserId, out var sender))
                 return;
-
-            using var helloStream = new MemoryStream(helloFrame, writable: false);
-            using var reader = new BinaryReader(helloStream, Encoding.UTF8, leaveOpen: false);
-            if ((Protocol.MessageKind)reader.ReadByte() != Protocol.MessageKind.Hello)
-                throw new InvalidDataException("Expected hello packet.");
-
-            var protocol = reader.ReadInt32();
-            var modVersion = Protocol.ReadBoundedString(reader, 64);
-            var username = Protocol.CleanUsername(Protocol.ReadBoundedString(reader, Protocol.MaxUsernameLength));
-
-            if (protocol != Protocol.Version)
-            {
-                await SendRawReject(stream, $"Protocol mismatch. Host={Protocol.Version}, client={protocol}", token).ConfigureAwait(false);
+            if (packet.SenderId != sender.Id)
                 return;
-            }
-            if (!string.Equals(modVersion, SRMP2.BuildInfo.Version, StringComparison.Ordinal))
-            {
-                await SendRawReject(stream, $"SRMP2 version mismatch. Host={SRMP2.BuildInfo.Version}, client={modVersion}", token).ConfigureAwait(false);
-                return;
-            }
-            if (_hostConnections.Count + 1 >= Protocol.MaxPlayers)
-            {
-                await SendRawReject(stream, "Server is full.", token).ConfigureAwait(false);
-                return;
-            }
-
-            var id = Interlocked.Increment(ref _nextPlayerId);
-            var peer = new PeerInfo(id, username);
-            connection = new HostConnection(id, username, modVersion, client, stream);
-            _hostConnections[id] = connection;
-            _peers[id] = peer;
-
-            var peerSnapshot = _peers.Values.OrderBy(x => x.Id).ToArray();
-            var welcome = Protocol.BuildTcpFrame(Protocol.MessageKind.Welcome, writer =>
-            {
-                writer.Write(Protocol.Version);
-                writer.Write(id);
-                writer.Write(SessionId.ToByteArray());
-                writer.Write(peerSnapshot.Length);
-                foreach (var existing in peerSnapshot)
-                {
-                    writer.Write(existing.Id);
-                    writer.Write(existing.Username);
-                    writer.Write(existing.SceneName ?? string.Empty);
-                }
-            });
-            await connection.Send(welcome, token).ConfigureAwait(false);
-
-            var joined = Protocol.BuildTcpFrame(Protocol.MessageKind.PeerJoined, writer =>
-            {
-                writer.Write(id);
-                writer.Write(username);
-                writer.Write(peer.SceneName ?? string.Empty);
-            });
-            Broadcast(joined, exceptPlayerId: id);
-            Enqueue(() => PeerJoined?.Invoke(peer));
-            _log($"{username} (#{id}) connected using SRMP2 {modVersion}.");
-
-            while (!token.IsCancellationRequested)
-            {
-                var frame = await ReadFrame(stream, token).ConfigureAwait(false);
-                if (frame == null)
-                    break;
-                HandleHostFrame(connection, frame);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (Exception ex)
-        {
-            if (!token.IsCancellationRequested)
-                _log($"Peer connection ended: {ex.Message}");
-        }
-        finally
-        {
-            if (connection != null)
-                RemoveHostPeer(connection.Id);
-            try { client.Close(); } catch { }
-        }
-    }
-
-    private void HandleHostFrame(HostConnection connection, byte[] frame)
-    {
-        using var stream = new MemoryStream(frame, writable: false);
-        using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
-        var kind = (Protocol.MessageKind)reader.ReadByte();
-
-        switch (kind)
-        {
-            case Protocol.MessageKind.Chat:
-            {
-                var text = Protocol.CleanChat(Protocol.ReadBoundedString(reader, Protocol.MaxChatLength));
-                if (text.Length == 0)
-                    return;
-                Enqueue(() => ChatReceived?.Invoke(connection.Id, text));
-                var outgoing = Protocol.BuildTcpFrame(Protocol.MessageKind.Chat, writer =>
-                {
-                    writer.Write(connection.Id);
-                    writer.Write(text);
-                });
-                Broadcast(outgoing);
-                break;
-            }
-            case Protocol.MessageKind.SceneChanged:
-            {
-                var scene = Protocol.ReadBoundedString(reader, Protocol.MaxSceneLength);
-                if (_peers.TryGetValue(connection.Id, out var peer))
-                    peer.SceneName = scene;
-                Enqueue(() => SceneChanged?.Invoke(connection.Id, scene));
-                var outgoing = Protocol.BuildTcpFrame(Protocol.MessageKind.SceneChanged, writer =>
-                {
-                    writer.Write(connection.Id);
-                    writer.Write(scene);
-                });
-                Broadcast(outgoing, exceptPlayerId: connection.Id);
-                break;
-            }
-            case Protocol.MessageKind.Ping:
-                _ = connection.Send(Protocol.BuildTcpFrame(Protocol.MessageKind.Pong), _cancellation?.Token ?? CancellationToken.None);
-                break;
-            case Protocol.MessageKind.Disconnect:
-                connection.Close();
-                break;
-        }
-    }
-
-    private async Task HostUdpLoop(CancellationToken token)
-    {
-        while (!token.IsCancellationRequested)
-        {
-            UdpReceiveResult result;
-            try
-            {
-                result = await _udp.ReceiveAsync().ConfigureAwait(false);
-            }
-            catch (ObjectDisposedException)
-            {
-                break;
-            }
-            catch (SocketException) when (token.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                if (!token.IsCancellationRequested)
-                    _log($"Host UDP receive failed: {ex.Message}");
-                continue;
-            }
-
-            if (!Protocol.TryReadUdp(result.Buffer, out var packet) || packet.SessionId != SessionId)
-                continue;
-            if (!_hostConnections.TryGetValue(packet.SenderId, out var connection))
-                continue;
-            if (!IsSameRemoteAddress(connection, result.RemoteEndPoint))
-                continue;
-
-            if (packet.Kind == Protocol.UdpKind.Hello)
-            {
-                connection.UdpEndpoint = result.RemoteEndPoint;
-                continue;
-            }
-
-            if (packet.Kind != Protocol.UdpKind.PlayerSnapshot)
-                continue;
-
-            if (connection.UdpEndpoint == null)
-                connection.UdpEndpoint = result.RemoteEndPoint;
-            else if (!connection.UdpEndpoint.Equals(result.RemoteEndPoint))
-                continue;
 
             var snapshot = packet.Snapshot;
             Enqueue(() => SnapshotReceived?.Invoke(snapshot));
-
-            foreach (var target in _hostConnections.Values)
+            foreach (var target in _hostPeersById.Values.ToArray())
             {
-                if (target.Id == connection.Id || target.UdpEndpoint == null)
-                    continue;
-                _ = SendUdp(result.Buffer, target.UdpEndpoint);
+                if (target.Id != sender.Id)
+                    SendMovement(target.ProductUserId, bytes);
             }
         }
-    }
-
-    private async Task ClientUdpLoop(CancellationToken token)
-    {
-        while (!token.IsCancellationRequested)
+        else if (Mode == SessionMode.Client && remoteUserId == _hostUserId && packet.SenderId != LocalPlayerId)
         {
-            UdpReceiveResult result;
-            try
-            {
-                result = await _udp.ReceiveAsync().ConfigureAwait(false);
-            }
-            catch (ObjectDisposedException)
-            {
-                break;
-            }
-            catch (SocketException) when (token.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                if (!token.IsCancellationRequested)
-                    _log($"Client UDP receive failed: {ex.Message}");
-                continue;
-            }
-
-            if (!Protocol.TryReadUdp(result.Buffer, out var packet))
-                continue;
-            if (SessionId == Guid.Empty || packet.SessionId != SessionId)
-                continue;
-            if (packet.Kind != Protocol.UdpKind.PlayerSnapshot || packet.SenderId == LocalPlayerId)
-                continue;
-
             var snapshot = packet.Snapshot;
             Enqueue(() => SnapshotReceived?.Invoke(snapshot));
         }
     }
 
-    private bool IsSameRemoteAddress(HostConnection connection, IPEndPoint udpEndpoint)
+    private bool SendControl(IntPtr remoteUserId, byte[] frame, bool disableAutoAccept = true)
     {
-        try
-        {
-            var tcpEndpoint = (IPEndPoint)connection.Client.Client.RemoteEndPoint;
-            return tcpEndpoint.Address.Equals(udpEndpoint.Address)
-                   || tcpEndpoint.Address.MapToIPv6().Equals(udpEndpoint.Address.MapToIPv6());
-        }
-        catch
-        {
+        if (remoteUserId == IntPtr.Zero || frame == null || frame.Length == 0 || frame.Length > Protocol.MaxFrameBytes)
             return false;
-        }
-    }
 
-    private void SendClientUdpHello()
-    {
-        if (Mode != SessionMode.Client || LocalPlayerId <= 0 || SessionId == Guid.Empty || _serverUdpEndpoint == null)
-            return;
-        var hello = Protocol.BuildUdpHello(SessionId, LocalPlayerId);
-        _ = SendUdp(hello, _serverUdpEndpoint);
-    }
+        var messageId = NextControlMessageId();
+        var fragmentCount = (frame.Length + ControlFragmentPayloadBytes - 1) / ControlFragmentPayloadBytes;
+        if (fragmentCount <= 0 || fragmentCount > byte.MaxValue)
+            return false;
 
-    private async Task SendUdp(byte[] data, IPEndPoint endpoint)
-    {
-        var udp = _udp;
-        if (udp == null || endpoint == null)
-            return;
-
-        try
+        for (var index = 0; index < fragmentCount; index++)
         {
-            await _udpSendLock.WaitAsync().ConfigureAwait(false);
-            try
+            var offset = index * ControlFragmentPayloadBytes;
+            var count = Math.Min(ControlFragmentPayloadBytes, frame.Length - offset);
+            var packet = new byte[ControlHeaderBytes + count];
+            using (var stream = new MemoryStream(packet, writable: true))
+            using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: false))
             {
-                await udp.SendAsync(data, data.Length, endpoint).ConfigureAwait(false);
+                writer.Write(ControlMagic);
+                writer.Write(messageId);
+                writer.Write((byte)index);
+                writer.Write((byte)fragmentCount);
+                writer.Write(frame, offset, count);
             }
-            finally
+
+            var result = _eos.Send(
+                remoteUserId,
+                ControlChannel,
+                packet,
+                EosNative.PacketReliability.ReliableOrdered,
+                disableAutoAccept);
+            if (result != EosNative.Result.Success)
             {
-                _udpSendLock.Release();
+                _log($"EOS reliable send failed: {result}");
+                return false;
             }
         }
-        catch (ObjectDisposedException)
+
+        return true;
+    }
+
+    private bool TryReassembleControl(IntPtr remoteUserId, byte[] packet, out byte[] frame)
+    {
+        frame = null;
+        if (packet == null || packet.Length < ControlHeaderBytes)
+            return false;
+
+        using var stream = new MemoryStream(packet, writable: false);
+        using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
+        if (reader.ReadUInt32() != ControlMagic)
+            return false;
+
+        var messageId = reader.ReadUInt16();
+        var fragmentIndex = reader.ReadByte();
+        var fragmentCount = reader.ReadByte();
+        if (fragmentCount == 0 || fragmentIndex >= fragmentCount)
+            return false;
+
+        var payloadLength = packet.Length - ControlHeaderBytes;
+        var payload = new byte[payloadLength];
+        if (payloadLength > 0)
+            Buffer.BlockCopy(packet, ControlHeaderBytes, payload, 0, payloadLength);
+
+        var key = (remoteUserId, messageId);
+        if (!_controlAssemblies.TryGetValue(key, out var assembly) || assembly.Fragments.Length != fragmentCount)
         {
+            assembly = new ControlAssembly(fragmentCount);
+            _controlAssemblies[key] = assembly;
         }
-        catch (SocketException)
+
+        if (assembly.Fragments[fragmentIndex] == null)
         {
+            assembly.Fragments[fragmentIndex] = payload;
+            assembly.Received++;
         }
-        catch (Exception ex)
+        if (assembly.Received != fragmentCount)
+            return false;
+
+        var total = 0;
+        foreach (var fragment in assembly.Fragments)
         {
-            _log($"UDP send failed: {ex.Message}");
+            if (fragment == null)
+                return false;
+            total += fragment.Length;
+            if (total > Protocol.MaxFrameBytes)
+            {
+                _controlAssemblies.Remove(key);
+                return false;
+            }
+        }
+
+        frame = new byte[total];
+        var destination = 0;
+        foreach (var fragment in assembly.Fragments)
+        {
+            Buffer.BlockCopy(fragment, 0, frame, destination, fragment.Length);
+            destination += fragment.Length;
+        }
+        _controlAssemblies.Remove(key);
+        return true;
+    }
+
+    private void SendMovement(IntPtr remoteUserId, byte[] bytes)
+    {
+        var result = _eos.Send(
+            remoteUserId,
+            MovementChannel,
+            bytes,
+            EosNative.PacketReliability.UnreliableUnordered,
+            disableAutoAccept: true);
+        if (result != EosNative.Result.Success && result != EosNative.Result.NoConnection)
+            _log($"EOS movement send failed: {result}");
+    }
+
+    private void BroadcastControl(byte[] frame, int exceptPlayerId = -1)
+    {
+        foreach (var connection in _hostPeersById.Values.ToArray())
+        {
+            if (connection.Id != exceptPlayerId)
+                SendControl(connection.ProductUserId, frame);
         }
     }
 
-    private void SendClientFrame(byte[] frame)
+    private void SendReject(IntPtr remoteUserId, string reason)
     {
-        var stream = _clientStream;
-        var token = _cancellation?.Token ?? CancellationToken.None;
-        if (stream == null || Mode != SessionMode.Client)
+        SendControl(remoteUserId, Protocol.BuildTcpFrame(Protocol.MessageKind.Reject, writer => writer.Write(reason)));
+    }
+
+    private void RemoveHostPeer(int id, bool closeConnection)
+    {
+        if (!_hostPeersById.TryGetValue(id, out var connection))
             return;
-        _ = SendFrameSafe(stream, _clientSendLock, frame, token);
-    }
 
-    private async Task SendFrameSafe(NetworkStream stream, SemaphoreSlim gate, byte[] frame, CancellationToken token)
-    {
-        try
-        {
-            await SendFrame(stream, gate, frame, token).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            if (!token.IsCancellationRequested)
-                _log($"TCP send failed: {ex.Message}");
-        }
-    }
-
-    private void Broadcast(byte[] frame, int exceptPlayerId = -1)
-    {
-        var token = _cancellation?.Token ?? CancellationToken.None;
-        foreach (var connection in _hostConnections.Values)
-        {
-            if (connection.Id == exceptPlayerId)
-                continue;
-            _ = connection.Send(frame, token);
-        }
-    }
-
-    private void RemoveHostPeer(int id)
-    {
-        if (!_hostConnections.TryRemove(id, out var connection))
-            return;
-
-        connection.Close();
+        _hostPeersById.Remove(id);
+        _hostPeersByUser.Remove(connection.ProductUserId);
         _peers.TryRemove(id, out _);
+        RemoveControlAssembliesFor(connection.ProductUserId);
+        if (closeConnection)
+            _eos.CloseConnection(connection.ProductUserId);
+
         var left = Protocol.BuildTcpFrame(Protocol.MessageKind.PeerLeft, writer => writer.Write(id));
-        Broadcast(left, exceptPlayerId: id);
+        BroadcastControl(left, exceptPlayerId: id);
         Enqueue(() => PeerLeft?.Invoke(id));
     }
 
-    private async Task SendRawReject(NetworkStream stream, string reason, CancellationToken token)
+    private void RemoveControlAssembliesFor(IntPtr remoteUserId)
     {
-        var gate = new SemaphoreSlim(1, 1);
-        try
-        {
-            var frame = Protocol.BuildTcpFrame(Protocol.MessageKind.Reject, writer => writer.Write(reason));
-            await SendFrame(stream, gate, frame, token).ConfigureAwait(false);
-        }
-        finally
-        {
-            gate.Dispose();
-        }
+        var keys = _controlAssemblies.Keys.Where(x => x.RemoteUser == remoteUserId).ToArray();
+        foreach (var key in keys)
+            _controlAssemblies.Remove(key);
     }
 
-    private static async Task SendFrame(NetworkStream stream, SemaphoreSlim gate, byte[] frame, CancellationToken token)
+    private void FailPendingSession(string status)
     {
-        if (frame.Length > Protocol.MaxFrameBytes)
-            throw new InvalidDataException("Frame is too large.");
-
-        var length = BitConverter.GetBytes(frame.Length);
-        await gate.WaitAsync(token).ConfigureAwait(false);
-        try
-        {
-            await stream.WriteAsync(length, 0, length.Length, token).ConfigureAwait(false);
-            await stream.WriteAsync(frame, 0, frame.Length, token).ConfigureAwait(false);
-            await stream.FlushAsync(token).ConfigureAwait(false);
-        }
-        finally
-        {
-            gate.Release();
-        }
-    }
-
-    private static async Task<byte[]> ReadFrame(NetworkStream stream, CancellationToken token)
-    {
-        var lengthBytes = new byte[4];
-        if (!await ReadExactly(stream, lengthBytes, token).ConfigureAwait(false))
-            return null;
-
-        var length = BitConverter.ToInt32(lengthBytes, 0);
-        if (length <= 0 || length > Protocol.MaxFrameBytes)
-            throw new InvalidDataException($"Invalid frame length: {length}.");
-
-        var body = new byte[length];
-        return await ReadExactly(stream, body, token).ConfigureAwait(false) ? body : null;
-    }
-
-    private static async Task<bool> ReadExactly(NetworkStream stream, byte[] buffer, CancellationToken token)
-    {
-        var offset = 0;
-        while (offset < buffer.Length)
-        {
-            var read = await stream.ReadAsync(buffer, offset, buffer.Length - offset, token).ConfigureAwait(false);
-            if (read == 0)
-                return false;
-            offset += read;
-        }
-        return true;
+        _log(status);
+        StopInternal(status, notify: true);
     }
 
     private void StopInternal(string status, bool notify)
     {
-        SessionMode oldMode;
-        CancellationTokenSource cts;
-        TcpListener listener;
-        TcpClient client;
-        UdpClient udp;
-        HostConnection[] hostConnections;
+        var oldMode = Mode;
+        var oldLobbyId = _lobbyId;
+        var oldHostUserId = _hostUserId;
+        var remoteUsers = _hostPeersByUser.Keys.ToArray();
+        var wasActive = oldMode != SessionMode.Offline;
 
-        lock (_stateLock)
+        Mode = SessionMode.Offline;
+        _sessionReady = false;
+        LocalPlayerId = 0;
+        SessionId = Guid.Empty;
+        _hostUserId = IntPtr.Zero;
+        _lobbyId = string.Empty;
+        _nextPlayerId = 1;
+        _peers.Clear();
+        _hostPeersById.Clear();
+        _hostPeersByUser.Clear();
+        _controlAssemblies.Clear();
+
+        if (wasActive && _eos.IsLoggedIn)
         {
-            oldMode = Mode;
-            if (oldMode == SessionMode.Offline && _cancellation == null)
-                return;
+            if (oldMode == SessionMode.Host && !string.IsNullOrWhiteSpace(oldLobbyId))
+                _eos.DestroyLobby(oldLobbyId);
+            else if (oldMode == SessionMode.Client && !string.IsNullOrWhiteSpace(oldLobbyId))
+                _eos.LeaveLobby(oldLobbyId);
 
-            Mode = SessionMode.Offline;
-            LocalPlayerId = 0;
-            SessionId = Guid.Empty;
-            _serverUdpEndpoint = null;
-
-            cts = _cancellation;
-            listener = _listener;
-            client = _client;
-            udp = _udp;
-            hostConnections = _hostConnections.Values.ToArray();
-
-            _cancellation = null;
-            _listener = null;
-            _client = null;
-            _clientStream = null;
-            _udp = null;
-            _hostConnections.Clear();
-            _peers.Clear();
+            if (oldHostUserId != IntPtr.Zero)
+                _eos.CloseConnection(oldHostUserId);
+            foreach (var remote in remoteUsers)
+                _eos.CloseConnection(remote);
         }
 
-        try { cts?.Cancel(); } catch { }
-        try { listener?.Stop(); } catch { }
-        try { client?.Close(); } catch { }
-        try { udp?.Close(); } catch { }
-        foreach (var connection in hostConnections)
-            connection.Close();
-
         SetStatus(status);
-        if (notify && oldMode != SessionMode.Offline)
+        if (notify && wasActive)
             Enqueue(() => SessionEnded?.Invoke());
     }
 
     private void SetStatus(string status)
     {
-        StatusText = status;
-        Enqueue(() => StatusChanged?.Invoke(status));
+        StatusText = status ?? string.Empty;
+        Enqueue(() => StatusChanged?.Invoke(StatusText));
     }
 
     private void Enqueue(Action action)
@@ -882,54 +859,83 @@ public sealed class NetworkSession : IDisposable
             _mainThread.Enqueue(action);
     }
 
-    private static int NormalizePort(int port)
-        => port is > 0 and <= 65535 ? port : Protocol.DefaultPort;
+    private ushort NextControlMessageId()
+    {
+        unchecked
+        {
+            _nextControlMessageId++;
+            if (_nextControlMessageId == 0)
+                _nextControlMessageId++;
+            return _nextControlMessageId;
+        }
+    }
+
+    private static string GenerateServerCode()
+    {
+        var chars = new char[7];
+        for (var i = 0; i < chars.Length; i++)
+            chars[i] = LobbyAlphabet[RandomNumberGenerator.GetInt32(LobbyAlphabet.Length)];
+        return new string(chars);
+    }
+
+    private static string NormalizeServerCode(string code)
+    {
+        if (string.IsNullOrWhiteSpace(code))
+            return string.Empty;
+        var builder = new StringBuilder(7);
+        foreach (var c in code.Trim().ToUpperInvariant())
+        {
+            if (!char.IsWhiteSpace(c) && c != '-')
+                builder.Append(c);
+        }
+        return builder.ToString();
+    }
+
+    private static bool IsValidServerCode(string code)
+    {
+        if (code == null || code.Length != 7)
+            return false;
+        foreach (var c in code)
+        {
+            if (LobbyAlphabet.IndexOf(c) < 0)
+                return false;
+        }
+        return true;
+    }
 
     public void Dispose()
     {
+        if (_disposed)
+            return;
         StopInternal("Offline", notify: false);
-        _clientSendLock.Dispose();
-        _udpSendLock.Dispose();
+        _eos.Dispose();
+        _disposed = true;
     }
 
-    private sealed class HostConnection
+    private sealed class HostPeer
     {
-        private readonly SemaphoreSlim _sendLock = new(1, 1);
-
-        internal HostConnection(int id, string username, string modVersion, TcpClient client, NetworkStream stream)
+        internal HostPeer(int id, string username, string modVersion, IntPtr productUserId)
         {
             Id = id;
             Username = username;
             ModVersion = modVersion;
-            Client = client;
-            Stream = stream;
+            ProductUserId = productUserId;
         }
 
         internal int Id { get; }
         internal string Username { get; }
         internal string ModVersion { get; }
-        internal TcpClient Client { get; }
-        internal NetworkStream Stream { get; }
-        internal IPEndPoint UdpEndpoint { get; set; }
+        internal IntPtr ProductUserId { get; }
+    }
 
-        internal Task Send(byte[] frame, CancellationToken token)
-            => SendFrameSafeInternal(Stream, _sendLock, frame, token);
-
-        private static async Task SendFrameSafeInternal(NetworkStream stream, SemaphoreSlim gate, byte[] frame, CancellationToken token)
+    private sealed class ControlAssembly
+    {
+        internal ControlAssembly(int fragmentCount)
         {
-            try
-            {
-                await SendFrame(stream, gate, frame, token).ConfigureAwait(false);
-            }
-            catch
-            {
-                // The owning receive loop removes dead peers. Avoid tearing down the host from a send race.
-            }
+            Fragments = new byte[fragmentCount][];
         }
 
-        internal void Close()
-        {
-            try { Client.Close(); } catch { }
-        }
+        internal byte[][] Fragments { get; }
+        internal int Received { get; set; }
     }
 }
