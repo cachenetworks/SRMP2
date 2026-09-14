@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using MelonLoader;
 using SRMP2.Multiplayer;
 using SRMP2.Networking;
 using UnityEngine;
@@ -11,24 +12,42 @@ internal sealed class MultiplayerOverlay
     private readonly NetworkSession _network;
     private readonly MultiplayerController _multiplayer;
 
-    private string _username = "Rancher";
-    private string _host = "127.0.0.1";
-    private string _port = Protocol.DefaultPort.ToString();
-    private string _chat = string.Empty;
+    private readonly string _username;
+    private readonly string _host;
+    private readonly int _port;
 
     internal MultiplayerOverlay(NetworkSession network, MultiplayerController multiplayer)
     {
         _network = network;
         _multiplayer = multiplayer;
 
+        var defaultUsername = "Rancher";
         try
         {
             var user = Environment.UserName;
             if (!string.IsNullOrWhiteSpace(user))
-                _username = Protocol.CleanUsername(user);
+                defaultUsername = Protocol.CleanUsername(user);
         }
         catch
         {
+        }
+
+        try
+        {
+            var category = MelonPreferences.CreateCategory("SRMP2", "SRMP2 Multiplayer");
+            var usernameEntry = category.CreateEntry("Username", defaultUsername, "Rancher name");
+            var hostEntry = category.CreateEntry("Host", "127.0.0.1", "Host / IP");
+            var portEntry = category.CreateEntry("Port", Protocol.DefaultPort, "TCP + UDP port");
+
+            _username = Protocol.CleanUsername(usernameEntry.Value);
+            _host = string.IsNullOrWhiteSpace(hostEntry.Value) ? "127.0.0.1" : hostEntry.Value.Trim();
+            _port = NormalizePort(portEntry.Value);
+        }
+        catch
+        {
+            _username = defaultUsername;
+            _host = "127.0.0.1";
+            _port = Protocol.DefaultPort;
         }
     }
 
@@ -42,19 +61,17 @@ internal sealed class MultiplayerOverlay
         const float left = 18f;
         const float top = 18f;
         const float width = 430f;
-        var height = _network.IsConnected ? 520f : 305f;
+        var height = _network.IsConnected ? 500f : 300f;
 
-        // Avoid GUILayout entirely here. Slime Rancher 2's IL2CPP build can strip
-        // GUILayout.BeginArea overloads, causing MelonLoader's method-unstripping
-        // fallback to throw every frame. The immediate-mode GUI calls below are
-        // simpler bindings and don't require the stripped layout API.
+        // Avoid GUILayout and all editable IMGUI controls. SR2 strips several
+        // state-object methods used internally by GUI.TextField/GUILayout.
         GUI.Box(new Rect(left, top, width, height), string.Empty);
 
         var x = left + 12f;
         var y = top + 10f;
         var contentWidth = width - 24f;
 
-        Label(x, ref y, contentWidth, $"SRMP2 {BuildInfo.Version}  |  F8 toggles this panel");
+        Label(x, ref y, contentWidth, $"SRMP2 {BuildInfo.Version}");
         Label(x, ref y, contentWidth, $"Status: {_network.StatusText}");
         y += 6f;
 
@@ -62,34 +79,27 @@ internal sealed class MultiplayerOverlay
             DrawConnectPanel(x, ref y, contentWidth);
         else
             DrawConnectedPanel(x, ref y, contentWidth);
-
-        if (GUI.Button(new Rect(x, top + height - 36f, contentWidth, 26f), "Hide panel"))
-            Visible = false;
     }
 
     private void DrawConnectPanel(float x, ref float y, float width)
     {
-        Label(x, ref y, width, "Rancher name");
-        _username = GUI.TextField(new Rect(x, y, width, 24f), _username, Protocol.MaxUsernameLength);
-        y += 30f;
+        Label(x, ref y, width, $"Rancher: {_username}");
+        Label(x, ref y, width, $"Host / IP: {_host}");
+        Label(x, ref y, width, $"Port: {_port} (TCP + UDP)");
 
-        Label(x, ref y, width, "Host / IP");
-        _host = GUI.TextField(new Rect(x, y, width, 24f), _host, 120);
-        y += 30f;
-
-        Label(x, ref y, width, "Port (TCP + UDP)");
-        _port = GUI.TextField(new Rect(x, y, width, 24f), _port, 5);
-        y += 34f;
-
+        y += 10f;
         var half = (width - 8f) * 0.5f;
-        if (GUI.Button(new Rect(x, y, half, 28f), "Host game"))
-            _network.StartHost(_username, ParsePort());
-        if (GUI.Button(new Rect(x + half + 8f, y, half, 28f), "Join game"))
-            _network.Join(_host, ParsePort(), _username);
-        y += 36f;
+        if (GUI.Button(new Rect(x, y, half, 30f), "Host game"))
+            _network.StartHost(_username, _port);
+        if (GUI.Button(new Rect(x + half + 8f, y, half, 30f), "Join game"))
+            _network.Join(_host, _port, _username);
+        y += 40f;
 
         GUI.Label(new Rect(x, y, width, 42f),
-            "The host must allow/forward both TCP and UDP on the selected port for Internet play.");
+            "Change Username, Host, or Port in MelonPreferences.cfg, then restart SR2.");
+        y += 46f;
+        GUI.Label(new Rect(x, y, width, 42f),
+            "Internet hosts must allow/forward both TCP and UDP on the selected port.");
     }
 
     private void DrawConnectedPanel(float x, ref float y, float width)
@@ -119,18 +129,15 @@ internal sealed class MultiplayerOverlay
         Label(x, ref y, width, "Chat");
         foreach (var line in _multiplayer.ChatLines)
         {
-            if (y > 392f)
+            if (y > 400f)
                 break;
             Label(x, ref y, width, line);
         }
 
-        var sendWidth = 70f;
-        _chat = GUI.TextField(new Rect(x, y, width - sendWidth - 8f, 24f), _chat, Protocol.MaxChatLength);
-        if (GUI.Button(new Rect(x + width - sendWidth, y, sendWidth, 24f), "Send"))
-            SendChat();
+        GUI.Label(new Rect(x, y, width, 24f), "Chat input temporarily disabled in SR2 IMGUI compatibility mode.");
         y += 32f;
 
-        if (GUI.Button(new Rect(x, y, width, 26f), "Disconnect"))
+        if (GUI.Button(new Rect(x, y, width, 28f), "Disconnect"))
             _network.Disconnect();
     }
 
@@ -140,22 +147,8 @@ internal sealed class MultiplayerOverlay
         y += 22f;
     }
 
-    private void SendChat()
+    private static int NormalizePort(int port)
     {
-        var text = Protocol.CleanChat(_chat);
-        if (text.Length == 0)
-            return;
-        _network.SendChat(text);
-        _chat = string.Empty;
-    }
-
-    private int ParsePort()
-    {
-        if (!int.TryParse(_port, out var port) || port <= 0 || port > 65535)
-        {
-            port = Protocol.DefaultPort;
-            _port = port.ToString();
-        }
-        return port;
+        return port > 0 && port <= 65535 ? port : Protocol.DefaultPort;
     }
 }
