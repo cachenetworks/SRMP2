@@ -1,5 +1,8 @@
 <Project>
   <PropertyGroup>
-    <GamePath>H:\SteamLibrary\steamapps\common\Slime Rancher 2</GamePath>
+    <!-- Set SLIME_RANCHER_2_PATH to avoid editing this file on another machine. -->
+    <GamePath Condition="'$(GamePath)' == '' and '$(SLIME_RANCHER_2_PATH)' != ''">$(SLIME_RANCHER_2_PATH)</GamePath>
+    <!-- Cache's current local install remains the fallback. -->
+    <GamePath Condition="'$(GamePath)' == ''">H:\SteamLibrary\steamapps\common\Slime Rancher 2</GamePath>
   </PropertyGroup>
 </Project>

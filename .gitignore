@@ -39,6 +39,9 @@ ScaffoldingReadMe.txt
 # dotenv environment variables file
 .env
 
+# SRMP2 local EOS development configuration
+**/eos.local.cfg
+
 # Others
 ~$*
 *~
