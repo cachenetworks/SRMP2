@@ -584,7 +584,10 @@ internal sealed class EosRuntime : IDisposable
                 Channel = channel,
                 DataLengthBytes = (uint)data.Length,
                 Data = handle.AddrOfPinnedObject(),
-                AllowDelayedDelivery = 0,
+                // Reliable control messages include the initial Hello/Welcome handshake.
+                // EOS drops packets sent before a P2P connection is established unless
+                // delayed delivery is enabled. Movement snapshots stay non-delayed.
+                AllowDelayedDelivery = reliability == EosNative.PacketReliability.UnreliableUnordered ? 0 : 1,
                 Reliability = reliability,
                 DisableAutoAcceptConnection = disableAutoAccept ? 1 : 0
             };
