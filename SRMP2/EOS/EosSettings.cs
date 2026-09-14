@@ -23,6 +23,8 @@ internal sealed class EosSettings
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "SRMP2");
 
+    internal static string ConfigPath => Path.Combine(ConfigDirectory, "eos.local.cfg");
+
     internal bool IsComplete =>
         !string.IsNullOrWhiteSpace(ProductId) &&
         !string.IsNullOrWhiteSpace(SandboxId) &&
@@ -61,7 +63,21 @@ internal sealed class EosSettings
         return settings;
     }
 
+    internal static void EnsureTemplateExists()
+    {
+        if (File.Exists(ConfigPath))
+            return;
 
+        Directory.CreateDirectory(ConfigDirectory);
+        File.WriteAllText(ConfigPath,
+            "# SRMP2 EOS development configuration\r\n" +
+            "# Values here override the built-in development defaults.\r\n" +
+            $"ProductId={DefaultProductId}\r\n" +
+            $"SandboxId={DefaultSandboxId}\r\n" +
+            $"DeploymentId={DefaultDeploymentId}\r\n" +
+            $"ClientId={DefaultClientId}\r\n" +
+            "# ClientSecret=OPTIONAL_OVERRIDE\r\n");
+    }
 
     private static string Read(IReadOnlyDictionary<string, string> values, string key, string fallback)
         => values.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)
