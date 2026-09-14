@@ -2,7 +2,6 @@ using MelonLoader;
 using SRMP2.Multiplayer;
 using SRMP2.Networking;
 using SRMP2.UI;
-using UnityEngine;
 
 [assembly: MelonInfo(typeof(SRMP2.Core), SRMP2.BuildInfo.Name, SRMP2.BuildInfo.Version, SRMP2.BuildInfo.Author, null)]
 [assembly: MelonGame("MonomiPark", "SlimeRancher2")]
@@ -21,7 +20,6 @@ public sealed class Core : MelonMod
     private NetworkSession _network;
     private MultiplayerController _multiplayer;
     private MultiplayerOverlay _overlay;
-    private bool _inputWarningShown;
     private bool _guiFailureShown;
 
     public override void OnInitializeMelon()
@@ -31,7 +29,7 @@ public sealed class Core : MelonMod
         _overlay = new MultiplayerOverlay(_network, _multiplayer);
 
         LoggerInstance.Msg($"{BuildInfo.Name} {BuildInfo.Version} initialized.");
-        LoggerInstance.Msg("Press F8 to toggle the SRMP2 multiplayer panel.");
+        LoggerInstance.Msg("SRMP2 multiplayer panel enabled.");
         LoggerInstance.Msg("SR2 bindings: SRCharacterController movement sync enabled.");
     }
 
@@ -39,21 +37,6 @@ public sealed class Core : MelonMod
     {
         _network?.Pump();
         _multiplayer?.Update();
-
-        try
-        {
-            if (Input.GetKeyDown(KeyCode.F8) && _overlay != null)
-                _overlay.Visible = !_overlay.Visible;
-        }
-        catch (Exception ex)
-        {
-            if (!_inputWarningShown)
-            {
-                _inputWarningShown = true;
-                LoggerInstance.Warning($"F8 hotkey is unavailable with this Unity input configuration: {ex.Message}");
-                LoggerInstance.Warning("The SRMP2 panel remains visible by default.");
-            }
-        }
     }
 
     public override void OnGUI()
@@ -67,7 +50,7 @@ public sealed class Core : MelonMod
         }
         catch (Exception ex)
         {
-            // IL2CPP games can strip Unity IMGUI overloads that aren't used by the
+            // IL2CPP games can strip Unity IMGUI methods that aren't used by the
             // base game. Never let a missing binding throw once per rendered frame.
             _overlay.Visible = false;
             if (!_guiFailureShown)
