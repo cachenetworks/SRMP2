@@ -61,7 +61,7 @@ internal sealed class MultiplayerOverlay
         const float left = 18f;
         const float top = 18f;
         const float width = 430f;
-        var height = _network.IsConnected ? 535f : 305f;
+        var height = _network.IsConnected ? 600f : 305f;
 
         GUI.Box(new Rect(left, top, width, height), string.Empty);
 
@@ -128,6 +128,8 @@ internal sealed class MultiplayerOverlay
     {
         Label(x, ref y, width, $"Mode: {_network.Mode}   Local ID: {_network.LocalPlayerId}");
         Label(x, ref y, width, $"EOS Lobby: {_network.ServerCode}");
+        Label(x, ref y, width, $"Host world: {(string.IsNullOrWhiteSpace(_network.HostWorldTarget) ? "waiting for gameplay" : _network.HostWorldTarget)}");
+        Label(x, ref y, width, $"World sync: {_multiplayer.WorldSyncStatus}");
         Label(x, ref y, width, $"SR2 player hook: {(_multiplayer.HasLocalPlayer ? "ready" : "waiting for gameplay")}");
         Label(x, ref y, width, $"Remote avatars: {_multiplayer.RemotePlayerCount}");
 

@@ -4,12 +4,12 @@ This document records the SR2 types confirmed from the current uploaded `Assembl
 
 ## Networking model
 
-SRMP2 0.1 uses two channels on the same port:
+SRMP2 0.1 uses two EOS P2P channels inside the joined EOS lobby:
 
-- **TCP:** handshake, peer join/leave, chat, scene metadata, future reliable world/state events.
-- **UDP:** high-frequency player transforms and, later, actor transforms where loss is preferable to head-of-line blocking.
+- **EOS channel 0 / ReliableOrdered:** handshake, peer join/leave, chat, scene metadata, host world target, and future reliable world/state events.
+- **EOS channel 1 / UnreliableUnordered:** high-frequency player transforms and, later, actor transforms where loss is preferable to head-of-line blocking.
 
-The host owns the session ID and player IDs. Clients cannot choose a player ID in accepted transform packets: the host associates the UDP sender with the already-authenticated TCP peer before relaying snapshots. Unity-facing callbacks are queued back to the main thread.
+The host owns the session ID and player IDs. Clients cannot choose a player ID in accepted transform packets: the host associates the EOS Product User ID with the already-authenticated peer before relaying snapshots. Unity-facing callbacks are queued back to the main thread.
 
 ## Confirmed SR2 hooks
 
@@ -82,7 +82,15 @@ Reliable spawn/despawn/identity packets should be TCP. Transform updates can be 
 
 Confirmed members include scene-group loading and current-scene-group access.
 
-Milestone 0.1 announces Unity scene names only. Full SR2 synchronization should move to scene-group/region identity so actor visibility and hibernation match SR2's streaming model.
+Unity active-scene names remain informational peer metadata only. They are not used to drive client world loading because SR2 streams many additive scene chunks inside one gameplay world.
+
+The host now publishes a separate, host-authoritative world target from `SceneLoader.CurrentSceneGroup.ReferenceId`, and only publishes groups where `SceneGroup.IsGameplay` is true. The target is included in the reliable `Welcome` handshake and is also sent as a dedicated reliable control message when the host changes gameplay groups.
+
+On a client that joins from the main menu, SRMP2 uses `GameContext.AutoSaveDirector.GetSaveToContinue()` and `AutoSaveDirector.BeginLoad(...)` so SR2 creates a normal gameplay session through its own save pipeline. Once gameplay exists, `SceneGroupList.GetSceneGroupFromReferenceId(...)` resolves the host target and `TeleportablePlayer.TeleportTo(...)` performs the cross-group transition near the host's latest replicated position. `TeleportablePlayer.CanTeleport()` must succeed before that transition is requested.
+
+This is deliberately not shared-save synchronization yet: the client bootstraps from its own local save so all required SR2 directors, models, and player state are initialized normally. If the client has no usable local save, SRMP2 keeps the EOS session connected and reports that a local SR2 save must be created or loaded instead of fabricating save state.
+
+Remote-player rendering remains snapshot-driven. A peer joining the EOS session does not create an avatar by itself; a remote placeholder is created only after a valid gameplay snapshot arrives and the receiving client has completed its own world alignment.
 
 ## Recommended implementation order
 
