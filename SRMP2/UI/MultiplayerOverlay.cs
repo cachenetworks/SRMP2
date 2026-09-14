@@ -39,83 +39,105 @@ internal sealed class MultiplayerOverlay
         if (!Visible)
             return;
 
+        const float left = 18f;
+        const float top = 18f;
+        const float width = 430f;
         var height = _network.IsConnected ? 520f : 305f;
-        GUILayout.BeginArea(new Rect(18f, 18f, 430f, height), GUI.skin.box);
-        GUILayout.Label($"SRMP2 {BuildInfo.Version}  |  F8 toggles this panel");
-        GUILayout.Label($"Status: {_network.StatusText}");
+
+        // Avoid GUILayout entirely here. Slime Rancher 2's IL2CPP build can strip
+        // GUILayout.BeginArea overloads, causing MelonLoader's method-unstripping
+        // fallback to throw every frame. The immediate-mode GUI calls below are
+        // simpler bindings and don't require the stripped layout API.
+        GUI.Box(new Rect(left, top, width, height), string.Empty);
+
+        var x = left + 12f;
+        var y = top + 10f;
+        var contentWidth = width - 24f;
+
+        Label(x, ref y, contentWidth, $"SRMP2 {BuildInfo.Version}  |  F8 toggles this panel");
+        Label(x, ref y, contentWidth, $"Status: {_network.StatusText}");
+        y += 6f;
 
         if (!_network.IsConnected)
-            DrawConnectPanel();
+            DrawConnectPanel(x, ref y, contentWidth);
         else
-            DrawConnectedPanel();
+            DrawConnectedPanel(x, ref y, contentWidth);
 
-        GUILayout.FlexibleSpace();
-        if (GUILayout.Button("Hide panel"))
+        if (GUI.Button(new Rect(x, top + height - 36f, contentWidth, 26f), "Hide panel"))
             Visible = false;
-        GUILayout.EndArea();
     }
 
-    private void DrawConnectPanel()
+    private void DrawConnectPanel(float x, ref float y, float width)
     {
-        GUILayout.Space(8f);
-        GUILayout.Label("Rancher name");
-        _username = GUILayout.TextField(_username, Protocol.MaxUsernameLength);
+        Label(x, ref y, width, "Rancher name");
+        _username = GUI.TextField(new Rect(x, y, width, 24f), _username, Protocol.MaxUsernameLength);
+        y += 30f;
 
-        GUILayout.Space(6f);
-        GUILayout.Label("Host / IP");
-        _host = GUILayout.TextField(_host, 120);
+        Label(x, ref y, width, "Host / IP");
+        _host = GUI.TextField(new Rect(x, y, width, 24f), _host, 120);
+        y += 30f;
 
-        GUILayout.Label("Port (TCP + UDP)");
-        _port = GUILayout.TextField(_port, 5);
+        Label(x, ref y, width, "Port (TCP + UDP)");
+        _port = GUI.TextField(new Rect(x, y, width, 24f), _port, 5);
+        y += 34f;
 
-        GUILayout.Space(10f);
-        GUILayout.BeginHorizontal();
-        if (GUILayout.Button("Host game"))
+        var half = (width - 8f) * 0.5f;
+        if (GUI.Button(new Rect(x, y, half, 28f), "Host game"))
             _network.StartHost(_username, ParsePort());
-        if (GUILayout.Button("Join game"))
+        if (GUI.Button(new Rect(x + half + 8f, y, half, 28f), "Join game"))
             _network.Join(_host, ParsePort(), _username);
-        GUILayout.EndHorizontal();
+        y += 36f;
 
-        GUILayout.Space(8f);
-        GUILayout.Label("The host must allow/forward both TCP and UDP on the selected port for Internet play.");
+        GUI.Label(new Rect(x, y, width, 42f),
+            "The host must allow/forward both TCP and UDP on the selected port for Internet play.");
     }
 
-    private void DrawConnectedPanel()
+    private void DrawConnectedPanel(float x, ref float y, float width)
     {
-        GUILayout.Space(6f);
-        GUILayout.Label($"Mode: {_network.Mode}   Local ID: {_network.LocalPlayerId}");
-        GUILayout.Label($"SR2 player hook: {(_multiplayer.HasLocalPlayer ? "ready" : "waiting for gameplay")}");
-        GUILayout.Label($"Remote avatars: {_multiplayer.RemotePlayerCount}");
+        Label(x, ref y, width, $"Mode: {_network.Mode}   Local ID: {_network.LocalPlayerId}");
+        Label(x, ref y, width, $"SR2 player hook: {(_multiplayer.HasLocalPlayer ? "ready" : "waiting for gameplay")}");
+        Label(x, ref y, width, $"Remote avatars: {_multiplayer.RemotePlayerCount}");
+        y += 4f;
 
-        GUILayout.Space(8f);
-        GUILayout.Label("Players");
+        Label(x, ref y, width, "Players");
         var peers = _network.Peers.ToArray();
         if (peers.Length == 0)
-            GUILayout.Label("(none)");
+        {
+            Label(x, ref y, width, "(none)");
+        }
         else
         {
             foreach (var peer in peers)
             {
                 var local = peer.Id == _network.LocalPlayerId ? " (you)" : string.Empty;
                 var scene = string.IsNullOrWhiteSpace(peer.SceneName) ? string.Empty : $"  [{peer.SceneName}]";
-                GUILayout.Label($"#{peer.Id} {peer.Username}{local}{scene}");
+                Label(x, ref y, width, $"#{peer.Id} {peer.Username}{local}{scene}");
             }
         }
 
-        GUILayout.Space(8f);
-        GUILayout.Label("Chat");
+        y += 4f;
+        Label(x, ref y, width, "Chat");
         foreach (var line in _multiplayer.ChatLines)
-            GUILayout.Label(line);
+        {
+            if (y > 392f)
+                break;
+            Label(x, ref y, width, line);
+        }
 
-        GUILayout.BeginHorizontal();
-        _chat = GUILayout.TextField(_chat, Protocol.MaxChatLength);
-        if (GUILayout.Button("Send", GUILayout.Width(70f)))
+        var sendWidth = 70f;
+        _chat = GUI.TextField(new Rect(x, y, width - sendWidth - 8f, 24f), _chat, Protocol.MaxChatLength);
+        if (GUI.Button(new Rect(x + width - sendWidth, y, sendWidth, 24f), "Send"))
             SendChat();
-        GUILayout.EndHorizontal();
+        y += 32f;
 
-        GUILayout.Space(8f);
-        if (GUILayout.Button("Disconnect"))
+        if (GUI.Button(new Rect(x, y, width, 26f), "Disconnect"))
             _network.Disconnect();
+    }
+
+    private static void Label(float x, ref float y, float width, string text)
+    {
+        GUI.Label(new Rect(x, y, width, 22f), text);
+        y += 22f;
     }
 
     private void SendChat()
