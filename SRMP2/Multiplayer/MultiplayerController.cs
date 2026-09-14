@@ -26,6 +26,7 @@ public sealed class MultiplayerController : IDisposable
     private Quaternion _lastSentRotation = Quaternion.identity;
     private ushort _sequence;
     private bool _wasConnected;
+    private string _lastAnnouncedScene = string.Empty;
 
     public MultiplayerController(NetworkSession network, Action<string> logger)
     {
@@ -49,7 +50,7 @@ public sealed class MultiplayerController : IDisposable
         var connected = _network.IsConnected;
         if (connected && !_wasConnected)
         {
-            _network.SendScene(SceneManager.GetActiveScene().name);
+            AnnounceActiveSceneIfChanged(force: true);
             AddChatLine($"* Connected to SRMP2 session {_network.SessionId}.");
         }
         _wasConnected = connected;
@@ -68,9 +69,14 @@ public sealed class MultiplayerController : IDisposable
 
     public void OnSceneInitialized(string sceneName)
     {
-        _localPlayer = null;
-        _nextPlayerSearch = 0f;
-        _network.SendScene(sceneName ?? SceneManager.GetActiveScene().name);
+        // Slime Rancher 2 streams many additive scene chunks while the player stays
+        // alive. Clearing the local controller for every initialized chunk caused
+        // continual FindObjectOfType rebinding and log spam. Let Unity's destroyed-
+        // object null semantics tell us when the real player controller is gone.
+        if (_localPlayer == null)
+            _nextPlayerSearch = 0f;
+
+        AnnounceActiveSceneIfChanged(force: false);
     }
 
     public void ClearRemotePlayers()
@@ -105,6 +111,26 @@ public sealed class MultiplayerController : IDisposable
         }
     }
 
+    private void AnnounceActiveSceneIfChanged(bool force)
+    {
+        if (!_network.IsConnected)
+            return;
+
+        try
+        {
+            var scene = SceneManager.GetActiveScene().name ?? string.Empty;
+            if (!force && string.Equals(scene, _lastAnnouncedScene, StringComparison.Ordinal))
+                return;
+
+            _lastAnnouncedScene = scene;
+            _network.SendScene(scene);
+        }
+        catch (Exception ex)
+        {
+            _log($"Could not announce active scene: {ex.Message}");
+        }
+    }
+
     private void SendLocalSnapshotIfNeeded()
     {
         try
@@ -126,8 +152,10 @@ public sealed class MultiplayerController : IDisposable
         }
         catch (Exception ex)
         {
-            // The player object can disappear mid-frame while SR2 swaps scene groups.
+            // The actual player object can still disappear during a real player/world
+            // transition. In that case release it and let the normal search reacquire it.
             _localPlayer = null;
+            _nextPlayerSearch = Time.unscaledTime + 0.25f;
             _log($"Player snapshot skipped: {ex.Message}");
         }
     }
@@ -191,6 +219,7 @@ public sealed class MultiplayerController : IDisposable
         _localPlayer = null;
         _sequence = 0;
         _wasConnected = false;
+        _lastAnnouncedScene = string.Empty;
         AddChatLine("* Session ended.");
     }
 
