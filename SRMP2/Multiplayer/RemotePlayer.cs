@@ -1,3 +1,4 @@
+using System;
 using SRMP2.Networking;
 using UnityEngine;
 
@@ -8,7 +9,12 @@ internal sealed class RemotePlayer
     private const float InterpolationSeconds = 0.10f;
 
     private readonly GameObject _root;
+    private readonly GameObject _fallbackBody;
     private readonly TextMesh _label;
+    private readonly BeatrixVisualLoader _visualLoader;
+    private readonly Action<string> _log;
+    private readonly RemoteVisualUpgradeState _visualUpgrade = new();
+    private GameObject _beatrixVisual;
     private Vector3 _fromPosition;
     private Vector3 _targetPosition;
     private Quaternion _fromRotation = Quaternion.identity;
@@ -17,23 +23,25 @@ internal sealed class RemotePlayer
     private ushort _lastSequence;
     private bool _hasSnapshot;
 
-    internal RemotePlayer(PeerInfo peer)
+    internal RemotePlayer(PeerInfo peer, BeatrixVisualLoader visualLoader, Action<string> logger)
     {
         Peer = peer;
+        _visualLoader = visualLoader;
+        _log = logger ?? (_ => { });
         _root = new GameObject($"SRMP2 Remote - {peer.Username} ({peer.Id})");
         UnityEngine.Object.DontDestroyOnLoad(_root);
 
-        var body = GameObject.CreatePrimitive(PrimitiveType.Capsule);
-        body.name = "Body";
-        body.transform.SetParent(_root.transform, worldPositionStays: false);
-        body.transform.localPosition = new Vector3(0f, 1f, 0f);
-        body.transform.localScale = new Vector3(0.72f, 1f, 0.72f);
+        _fallbackBody = GameObject.CreatePrimitive(PrimitiveType.Capsule);
+        _fallbackBody.name = "Body";
+        _fallbackBody.transform.SetParent(_root.transform, worldPositionStays: false);
+        _fallbackBody.transform.localPosition = new Vector3(0f, 1f, 0f);
+        _fallbackBody.transform.localScale = new Vector3(0.72f, 1f, 0.72f);
 
-        var collider = body.GetComponent<Collider>();
+        var collider = _fallbackBody.GetComponent<Collider>();
         if (collider != null)
             collider.enabled = false;
 
-        var renderer = body.GetComponent<Renderer>();
+        var renderer = _fallbackBody.GetComponent<Renderer>();
         if (renderer != null)
         {
             try
@@ -56,6 +64,8 @@ internal sealed class RemotePlayer
         _label.alignment = TextAlignment.Center;
         _label.characterSize = 0.12f;
         _label.fontSize = 32;
+
+        _visualLoader.RequestLoad();
     }
 
     internal PeerInfo Peer { get; private set; }
@@ -109,12 +119,46 @@ internal sealed class RemotePlayer
             if (direction.sqrMagnitude > 0.0001f)
                 _label.transform.rotation = Quaternion.LookRotation(direction);
         }
+
+        UpdateVisual();
     }
 
     internal void Destroy()
     {
+        _beatrixVisual = null;
         if (_root != null)
             UnityEngine.Object.Destroy(_root);
+    }
+
+    private void UpdateVisual()
+    {
+        if (_visualUpgrade.Phase != RemoteVisualUpgradePhase.Fallback)
+            return;
+
+        if (_visualLoader.Phase == BeatrixVisualLoadPhase.Failed)
+        {
+            if (_visualUpgrade.TryBeginUpgrade())
+            {
+                _visualUpgrade.MarkFailed();
+                _log($"Beatrix visual fallback for remote #{Peer.Id} ({Peer.Username}): shared assets unavailable.");
+            }
+            return;
+        }
+
+        if (_visualLoader.Phase != BeatrixVisualLoadPhase.Ready || !_visualUpgrade.TryBeginUpgrade())
+            return;
+
+        if (_visualLoader.TryCreateVisual(_root.transform, out _beatrixVisual, out var reason))
+        {
+            if (_fallbackBody != null)
+                _fallbackBody.SetActive(false);
+            _visualUpgrade.MarkSucceeded();
+            _log($"Upgraded remote player #{Peer.Id} ({Peer.Username}) to Beatrix visual.");
+            return;
+        }
+
+        _visualUpgrade.MarkFailed();
+        _log($"Beatrix visual fallback for remote #{Peer.Id} ({Peer.Username}): {reason}.");
     }
 
     private static bool IsSequenceNewer(ushort candidate, ushort previous)

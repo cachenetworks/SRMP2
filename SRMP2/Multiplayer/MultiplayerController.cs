@@ -22,6 +22,7 @@ public sealed class MultiplayerController : IDisposable
     private readonly Dictionary<int, RemotePlayer> _remotePlayers = new();
     private readonly Queue<string> _chatLines = new();
     private readonly ClientWorldJoinState _clientWorldJoin = new();
+    private readonly BeatrixVisualLoader _beatrixVisuals;
 
     private SRCharacterController _localPlayer;
     private SceneLoader _sceneLoader;
@@ -46,6 +47,7 @@ public sealed class MultiplayerController : IDisposable
     {
         _network = network;
         _log = logger ?? (_ => { });
+        _beatrixVisuals = new BeatrixVisualLoader(_log);
 
         _network.PeerJoined += OnPeerJoined;
         _network.PeerLeft += OnPeerLeft;
@@ -84,6 +86,7 @@ public sealed class MultiplayerController : IDisposable
             SendLocalSnapshotIfNeeded();
         }
 
+        _beatrixVisuals.Update();
         foreach (var remote in _remotePlayers.Values)
             remote.Update();
     }
@@ -106,6 +109,7 @@ public sealed class MultiplayerController : IDisposable
         foreach (var remote in _remotePlayers.Values)
             remote.Destroy();
         _remotePlayers.Clear();
+        _beatrixVisuals.Reset();
     }
 
     private void FindLocalPlayerIfNeeded()
@@ -383,7 +387,7 @@ public sealed class MultiplayerController : IDisposable
             if (!_network.TryGetPeer(snapshot.PlayerId, out var peer))
                 peer = new PeerInfo(snapshot.PlayerId, $"Rancher {snapshot.PlayerId}");
 
-            remote = new RemotePlayer(peer);
+            remote = new RemotePlayer(peer, _beatrixVisuals, _log);
             _remotePlayers[snapshot.PlayerId] = remote;
             _log($"Spawned remote player #{snapshot.PlayerId} ({peer.Username}) from gameplay snapshot.");
         }

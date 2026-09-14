@@ -1,3 +1,4 @@
+using SRMP2.Multiplayer;
 using SRMP2.Networking;
 
 var failures = new List<string>();
@@ -42,6 +43,31 @@ Check(join.Target == string.Empty && join.Phase == ClientWorldJoinPhase.WaitingF
 Check(!SnapshotRenderGate.ShouldRender(localPlayerReady: false, worldReady: true), "remote snapshots should not render before the local player exists");
 Check(!SnapshotRenderGate.ShouldRender(localPlayerReady: true, worldReady: false), "remote snapshots should not render before client world alignment");
 Check(SnapshotRenderGate.ShouldRender(localPlayerReady: true, worldReady: true), "remote snapshots should render once both prerequisites are ready");
+
+var visualLoad = new BeatrixVisualLoadState();
+Check(visualLoad.Phase == BeatrixVisualLoadPhase.NotStarted, "Beatrix visual loading should start idle");
+Check(visualLoad.TryBeginLoad(), "the first Beatrix asset request should start loading");
+Check(!visualLoad.TryBeginLoad(), "parallel snapshots should not start duplicate Beatrix asset loads");
+visualLoad.MarkFailed();
+Check(visualLoad.Phase == BeatrixVisualLoadPhase.Failed, "a failed Beatrix load should enter fallback state");
+Check(!visualLoad.TryBeginLoad(), "a failed Beatrix load should stay on the capsule until reset");
+visualLoad.Reset();
+Check(visualLoad.Phase == BeatrixVisualLoadPhase.NotStarted, "reset should allow Beatrix loading in a later world/session");
+Check(visualLoad.TryBeginLoad(), "Beatrix loading should restart after reset");
+visualLoad.MarkReady();
+Check(visualLoad.Phase == BeatrixVisualLoadPhase.Ready, "a successful Beatrix load should publish a reusable ready state");
+
+var visualUpgrade = new RemoteVisualUpgradeState();
+Check(visualUpgrade.TryBeginUpgrade(), "a fallback remote should allow one Beatrix visual upgrade attempt");
+Check(!visualUpgrade.TryBeginUpgrade(), "repeated snapshots should not create duplicate Beatrix visual upgrades");
+visualUpgrade.MarkSucceeded();
+Check(visualUpgrade.Phase == RemoteVisualUpgradePhase.Installed, "a successful upgrade should remain installed");
+Check(!visualUpgrade.TryBeginUpgrade(), "an installed Beatrix visual should never be installed twice");
+visualUpgrade.Reset();
+Check(visualUpgrade.TryBeginUpgrade(), "a reset remote visual should permit a fresh upgrade attempt");
+visualUpgrade.MarkFailed();
+Check(visualUpgrade.Phase == RemoteVisualUpgradePhase.Failed, "a failed remote visual upgrade should keep the capsule fallback");
+Check(!visualUpgrade.TryBeginUpgrade(), "a failed upgrade should not spam retries every snapshot");
 
 if (failures.Count == 0)
 {
