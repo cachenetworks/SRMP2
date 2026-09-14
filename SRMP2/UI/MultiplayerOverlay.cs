@@ -1,6 +1,5 @@
 using System;
 using System.Linq;
-using System.Threading.Tasks;
 using MelonLoader;
 using SRMP2.Multiplayer;
 using SRMP2.Networking;
@@ -12,15 +11,10 @@ internal sealed class MultiplayerOverlay
 {
     private readonly NetworkSession _network;
     private readonly MultiplayerController _multiplayer;
-
     private readonly string _username;
-    private readonly string _host;
-    private readonly int _port;
     private readonly string _savedJoinCode;
 
-    private string _hostInviteCode = string.Empty;
     private string _inviteStatus = string.Empty;
-    private bool _creatingInviteCode;
 
     internal MultiplayerOverlay(NetworkSession network, MultiplayerController multiplayer)
     {
@@ -42,20 +36,17 @@ internal sealed class MultiplayerOverlay
         {
             var category = MelonPreferences.CreateCategory("SRMP2", "SRMP2 Multiplayer");
             var usernameEntry = category.CreateEntry("Username", defaultUsername, "Rancher name");
-            var hostEntry = category.CreateEntry("Host", "127.0.0.1", "Direct-connect host / IP");
-            var portEntry = category.CreateEntry("Port", Protocol.DefaultPort, "TCP + UDP port");
-            var joinCodeEntry = category.CreateEntry("JoinCode", string.Empty, "Fallback invite code when clipboard is unavailable");
+            var joinCodeEntry = category.CreateEntry(
+                "JoinCode",
+                string.Empty,
+                "EOS lobby code fallback when clipboard is unavailable");
 
             _username = Protocol.CleanUsername(usernameEntry.Value);
-            _host = string.IsNullOrWhiteSpace(hostEntry.Value) ? "127.0.0.1" : hostEntry.Value.Trim();
-            _port = NormalizePort(portEntry.Value);
             _savedJoinCode = joinCodeEntry.Value?.Trim() ?? string.Empty;
         }
         catch
         {
             _username = defaultUsername;
-            _host = "127.0.0.1";
-            _port = Protocol.DefaultPort;
             _savedJoinCode = string.Empty;
         }
     }
@@ -70,7 +61,7 @@ internal sealed class MultiplayerOverlay
         const float left = 18f;
         const float top = 18f;
         const float width = 430f;
-        var height = _network.IsConnected ? 530f : 350f;
+        var height = _network.IsConnected ? 535f : 305f;
 
         GUI.Box(new Rect(left, top, width, height), string.Empty);
 
@@ -82,21 +73,36 @@ internal sealed class MultiplayerOverlay
         Label(x, ref y, contentWidth, $"Status: {_network.StatusText}");
         y += 6f;
 
-        if (!_network.IsConnected)
-            DrawConnectPanel(x, ref y, contentWidth);
-        else
+        if (_network.IsConnected)
             DrawConnectedPanel(x, ref y, contentWidth);
+        else
+            DrawConnectPanel(x, ref y, contentWidth);
     }
 
     private void DrawConnectPanel(float x, ref float y, float width)
     {
         Label(x, ref y, width, $"Rancher: {_username}");
-        Label(x, ref y, width, "SRMP-style invite codes");
-
+        Label(x, ref y, width, "Epic Online Services lobby + P2P");
         y += 6f;
+
+        if (_network.Mode != SessionMode.Offline)
+        {
+            GUI.Label(new Rect(x, y, width, 42f),
+                "Connecting through EOS. This can take a few seconds on the first Device ID login.");
+            y += 48f;
+
+            if (GUI.Button(new Rect(x, y, width, 30f), "Cancel"))
+            {
+                _network.Disconnect();
+                _inviteStatus = string.Empty;
+            }
+            y += 40f;
+            return;
+        }
+
         var half = (width - 8f) * 0.5f;
-        if (GUI.Button(new Rect(x, y, half, 30f), "Host + make code"))
-            StartHostWithInviteCode();
+        if (GUI.Button(new Rect(x, y, half, 30f), "Host EOS Game"))
+            StartHost();
         if (GUI.Button(new Rect(x + half + 8f, y, half, 30f), "Join copied code"))
             JoinInviteCode(ReadJoinCode());
         y += 40f;
@@ -114,22 +120,14 @@ internal sealed class MultiplayerOverlay
             y += 46f;
         }
 
-        y += 4f;
-        Label(x, ref y, width, "Direct connect fallback");
-        Label(x, ref y, width, $"Host / IP: {_host}");
-        Label(x, ref y, width, $"Port: {_port} (TCP + UDP)");
-
-        if (GUI.Button(new Rect(x, y, width, 28f), "Join configured IP directly"))
-            _network.Join(_host, _port, _username);
-        y += 36f;
-
-        GUI.Label(new Rect(x, y, width, 42f),
-            "Invite codes currently compact the host IPv4 + port. Internet hosting still requires TCP + UDP forwarding.");
+        GUI.Label(new Rect(x, y, width, 50f),
+            "EOS handles NAT traversal and relay fallback. SRMP2 does not require manual TCP/UDP 6996 port forwarding for EOS sessions.");
     }
 
     private void DrawConnectedPanel(float x, ref float y, float width)
     {
         Label(x, ref y, width, $"Mode: {_network.Mode}   Local ID: {_network.LocalPlayerId}");
+        Label(x, ref y, width, $"EOS Lobby: {_network.ServerCode}");
         Label(x, ref y, width, $"SR2 player hook: {(_multiplayer.HasLocalPlayer ? "ready" : "waiting for gameplay")}");
         Label(x, ref y, width, $"Remote avatars: {_multiplayer.RemotePlayerCount}");
 
@@ -137,23 +135,12 @@ internal sealed class MultiplayerOverlay
         {
             y += 4f;
             Label(x, ref y, width, "Server Code");
+            Label(x, ref y, width, string.IsNullOrWhiteSpace(_network.ServerCode) ? "(waiting for EOS)" : _network.ServerCode);
 
-            if (_creatingInviteCode)
+            if (!string.IsNullOrWhiteSpace(_network.ServerCode))
             {
-                Label(x, ref y, width, "Generating invite code...");
-            }
-            else if (!string.IsNullOrWhiteSpace(_hostInviteCode))
-            {
-                Label(x, ref y, width, _hostInviteCode);
                 if (GUI.Button(new Rect(x, y, width, 28f), "Copy Server Code"))
                     CopyInviteCode();
-                y += 36f;
-            }
-            else
-            {
-                Label(x, ref y, width, "Code unavailable");
-                if (GUI.Button(new Rect(x, y, width, 28f), "Retry code generation"))
-                    _ = GenerateHostInviteCodeAsync();
                 y += 36f;
             }
         }
@@ -169,6 +156,9 @@ internal sealed class MultiplayerOverlay
         {
             foreach (var peer in peers)
             {
+                if (y > 350f)
+                    break;
+
                 var local = peer.Id == _network.LocalPlayerId ? " (you)" : string.Empty;
                 var scene = string.IsNullOrWhiteSpace(peer.SceneName) ? string.Empty : $"  [{peer.SceneName}]";
                 Label(x, ref y, width, $"#{peer.Id} {peer.Username}{local}{scene}");
@@ -179,51 +169,26 @@ internal sealed class MultiplayerOverlay
         Label(x, ref y, width, "Chat");
         foreach (var line in _multiplayer.ChatLines)
         {
-            if (y > 430f)
+            if (y > 445f)
                 break;
             Label(x, ref y, width, line);
         }
 
-        GUI.Label(new Rect(x, y, width, 24f), "Chat input temporarily disabled in SR2 IMGUI compatibility mode.");
+        GUI.Label(new Rect(x, y, width, 24f),
+            "Chat input temporarily disabled in SR2 IMGUI compatibility mode.");
         y += 32f;
 
         if (GUI.Button(new Rect(x, y, width, 28f), "Disconnect"))
         {
             _network.Disconnect();
-            _hostInviteCode = string.Empty;
             _inviteStatus = string.Empty;
         }
     }
 
-    private void StartHostWithInviteCode()
+    private void StartHost()
     {
-        _network.StartHost(_username, _port);
-        _hostInviteCode = string.Empty;
-        _inviteStatus = "Generating server code...";
-        _ = GenerateHostInviteCodeAsync();
-    }
-
-    private async Task GenerateHostInviteCodeAsync()
-    {
-        if (_creatingInviteCode || _network.Mode != SessionMode.Host)
-            return;
-
-        _creatingInviteCode = true;
-        try
-        {
-            var code = await InviteCode.CreateForHostAsync(_network.Port).ConfigureAwait(false);
-            _hostInviteCode = code;
-            _inviteStatus = $"Server Code: {code}";
-        }
-        catch (Exception ex)
-        {
-            _hostInviteCode = string.Empty;
-            _inviteStatus = $"Could not create server code: {ex.Message}";
-        }
-        finally
-        {
-            _creatingInviteCode = false;
-        }
+        _inviteStatus = "Signing in and creating an EOS lobby...";
+        _network.StartHost(_username, Protocol.DefaultPort);
     }
 
     private string ReadJoinCode()
@@ -243,29 +208,30 @@ internal sealed class MultiplayerOverlay
 
     private void JoinInviteCode(string code)
     {
-        if (!InviteCode.TryDecode(code, out var host, out var port))
+        if (string.IsNullOrWhiteSpace(code))
         {
-            _inviteStatus = "Invalid server code. Copy the host's code first, or set SRMP2.JoinCode in MelonPreferences.cfg.";
+            _inviteStatus = "Copy a 7-character SRMP2 EOS server code first, or set SRMP2.JoinCode in MelonPreferences.cfg.";
             return;
         }
 
-        _inviteStatus = $"Joining {host}:{port} from server code...";
-        _network.Join(host, port, _username);
+        _inviteStatus = $"Joining EOS lobby {code.Trim().ToUpperInvariant()}...";
+        _network.JoinCode(code, _username);
     }
 
     private void CopyInviteCode()
     {
-        if (string.IsNullOrWhiteSpace(_hostInviteCode))
+        var code = _network.ServerCode;
+        if (string.IsNullOrWhiteSpace(code))
             return;
 
         try
         {
-            GUIUtility.systemCopyBuffer = _hostInviteCode;
+            GUIUtility.systemCopyBuffer = code;
             _inviteStatus = "Server code copied to clipboard.";
         }
         catch
         {
-            _inviteStatus = $"Server Code: {_hostInviteCode} (clipboard unavailable)";
+            _inviteStatus = $"Server Code: {code} (clipboard unavailable)";
         }
     }
 
@@ -273,10 +239,5 @@ internal sealed class MultiplayerOverlay
     {
         GUI.Label(new Rect(x, y, width, 22f), text);
         y += 22f;
-    }
-
-    private static int NormalizePort(int port)
-    {
-        return port > 0 && port <= 65535 ? port : Protocol.DefaultPort;
     }
 }
