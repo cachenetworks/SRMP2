@@ -289,8 +289,8 @@ internal static class EosNative
     {
         internal int ApiVersion;
         internal IntPtr LocalUserId;
-        internal IntPtr SocketId;
         internal IntPtr RemoteUserId;
+        internal IntPtr SocketId;
     }
 
     [StructLayout(LayoutKind.Sequential, Pack = 8)]
