@@ -7,13 +7,14 @@ namespace SRMP2.Networking;
 
 internal static class Protocol
 {
-    internal const int Version = 1;
+    internal const int Version = 2;
     internal const int DefaultPort = 6996;
     internal const int MaxPlayers = 8;
     internal const int MaxFrameBytes = 64 * 1024;
     internal const int MaxUsernameLength = 32;
     internal const int MaxChatLength = 300;
     internal const int MaxSceneLength = 160;
+    internal const int MaxWorldTargetLength = 160;
 
     // ASCII "SRM2" when read as little-endian uint.
     internal const uint UdpMagic = 0x324D5253;
@@ -29,7 +30,8 @@ internal static class Protocol
         SceneChanged = 7,
         Disconnect = 8,
         Ping = 9,
-        Pong = 10
+        Pong = 10,
+        HostWorldTarget = 11
     }
 
     internal enum UdpKind : byte

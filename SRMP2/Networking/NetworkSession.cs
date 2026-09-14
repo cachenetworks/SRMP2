@@ -43,6 +43,7 @@ public sealed class NetworkSession : IDisposable
     private readonly EosRuntime _eos;
     private readonly ConcurrentQueue<Action> _mainThread = new();
     private readonly ConcurrentDictionary<int, PeerInfo> _peers = new();
+    private readonly HostWorldTargetState _hostWorldTargetState = new(Protocol.MaxWorldTargetLength);
     private readonly Dictionary<IntPtr, HostPeer> _hostPeersByUser = new();
     private readonly Dictionary<int, HostPeer> _hostPeersById = new();
     private readonly Dictionary<(IntPtr RemoteUser, ushort MessageId), ControlAssembly> _controlAssemblies = new();
@@ -67,6 +68,7 @@ public sealed class NetworkSession : IDisposable
     public Guid SessionId { get; private set; } = Guid.Empty;
     public int Port => Protocol.DefaultPort; // retained for API compatibility; EOS P2P does not require this port.
     public string ServerCode => _lobbyId;
+    public string HostWorldTarget => _hostWorldTargetState.Current;
     public bool IsConnected => _sessionReady;
     public IReadOnlyCollection<PeerInfo> Peers => _peers.Values.OrderBy(x => x.Id).ToArray();
 
@@ -75,6 +77,7 @@ public sealed class NetworkSession : IDisposable
     public event Action<PlayerSnapshot> SnapshotReceived;
     public event Action<int, string> ChatReceived;
     public event Action<int, string> SceneChanged;
+    public event Action<string> HostWorldTargetChanged;
     public event Action<string> StatusChanged;
     public event Action SessionEnded;
 
@@ -306,6 +309,21 @@ public sealed class NetworkSession : IDisposable
         }
     }
 
+    public void PublishHostWorldTarget(string worldTarget)
+    {
+        if (!_sessionReady || Mode != SessionMode.Host)
+            return;
+
+        if (!_hostWorldTargetState.TryUpdate(worldTarget, out var normalized))
+            return;
+
+        var frame = Protocol.BuildTcpFrame(
+            Protocol.MessageKind.HostWorldTarget,
+            writer => writer.Write(normalized));
+        BroadcastControl(frame);
+        Enqueue(() => HostWorldTargetChanged?.Invoke(normalized));
+    }
+
     private void CreateHostLobby(int attempt)
     {
         if (Mode != SessionMode.Host)
@@ -497,6 +515,7 @@ public sealed class NetworkSession : IDisposable
                 writer.Write(Protocol.Version);
                 writer.Write(id);
                 writer.Write(SessionId.ToByteArray());
+                writer.Write(HostWorldTarget);
                 writer.Write(peerSnapshot.Length);
                 foreach (var existing in peerSnapshot)
                 {
@@ -543,6 +562,7 @@ public sealed class NetworkSession : IDisposable
                 if (sessionBytes.Length != 16)
                     throw new InvalidDataException("Invalid EOS welcome session id.");
                 var session = new Guid(sessionBytes);
+                var hostWorldTarget = Protocol.ReadBoundedString(reader, Protocol.MaxWorldTargetLength);
                 var peerCount = reader.ReadInt32();
                 if (peerCount < 1 || peerCount > Protocol.MaxPlayers)
                     throw new InvalidDataException("Invalid peer count.");
@@ -561,6 +581,7 @@ public sealed class NetworkSession : IDisposable
                 _peers.Clear();
                 foreach (var peer in receivedPeers)
                     _peers[peer.Id] = peer;
+                var worldTargetChanged = _hostWorldTargetState.TryUpdate(hostWorldTarget, out var normalizedHostWorldTarget);
                 _sessionReady = true;
 
                 SetStatus($"Connected via EOS as {_localUsername} (#{assignedId})");
@@ -571,6 +592,8 @@ public sealed class NetworkSession : IDisposable
                         if (peer.Id != LocalPlayerId)
                             PeerJoined?.Invoke(peer);
                     }
+                    if (worldTargetChanged)
+                        HostWorldTargetChanged?.Invoke(normalizedHostWorldTarget);
                 });
                 break;
             }
@@ -611,6 +634,13 @@ public sealed class NetworkSession : IDisposable
                 if (_peers.TryGetValue(senderId, out var peer))
                     peer.SceneName = scene;
                 Enqueue(() => SceneChanged?.Invoke(senderId, scene));
+                break;
+            }
+            case Protocol.MessageKind.HostWorldTarget:
+            {
+                var worldTarget = Protocol.ReadBoundedString(reader, Protocol.MaxWorldTargetLength);
+                if (_hostWorldTargetState.TryUpdate(worldTarget, out var normalized))
+                    Enqueue(() => HostWorldTargetChanged?.Invoke(normalized));
                 break;
             }
             case Protocol.MessageKind.Ping:
@@ -823,6 +853,7 @@ public sealed class NetworkSession : IDisposable
         SessionId = Guid.Empty;
         _hostUserId = IntPtr.Zero;
         _lobbyId = string.Empty;
+        _hostWorldTargetState.Reset();
         _nextPlayerId = 1;
         _peers.Clear();
         _hostPeersById.Clear();
