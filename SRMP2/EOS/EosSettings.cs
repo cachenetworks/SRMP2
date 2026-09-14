@@ -11,18 +11,17 @@ internal sealed class EosSettings
     internal const string DefaultSandboxId = "80c2297da3994ee0a1dd7b9db96da322";
     internal const string DefaultDeploymentId = "251ae107900e40e9953d2e0b26c60b6e";
     internal const string DefaultClientId = "xyza7891tt1CUTkIN3ufDVnLAZ9zkWol";
+    internal const string DefaultClientSecret = "sMUT+3As7VJo/Vk25jgZ3uIVL2Gd0QbEMqYLiMjKLP0";
 
     internal string ProductId { get; private set; } = DefaultProductId;
     internal string SandboxId { get; private set; } = DefaultSandboxId;
     internal string DeploymentId { get; private set; } = DefaultDeploymentId;
     internal string ClientId { get; private set; } = DefaultClientId;
-    internal string ClientSecret { get; private set; } = string.Empty;
+    internal string ClientSecret { get; private set; } = DefaultClientSecret;
 
     internal static string ConfigDirectory => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "SRMP2");
-
-    internal static string ConfigPath => Path.Combine(ConfigDirectory, "eos.local.cfg");
 
     internal bool IsComplete =>
         !string.IsNullOrWhiteSpace(ProductId) &&
@@ -58,25 +57,11 @@ internal sealed class EosSettings
         settings.SandboxId = Read(values, "SandboxId", DefaultSandboxId);
         settings.DeploymentId = Read(values, "DeploymentId", DefaultDeploymentId);
         settings.ClientId = Read(values, "ClientId", DefaultClientId);
-        settings.ClientSecret = Read(values, "ClientSecret", string.Empty);
+        settings.ClientSecret = Read(values, "ClientSecret", DefaultClientSecret);
         return settings;
     }
 
-    internal static void EnsureTemplateExists()
-    {
-        if (File.Exists(ConfigPath))
-            return;
 
-        Directory.CreateDirectory(ConfigDirectory);
-        File.WriteAllText(ConfigPath,
-            "# SRMP2 EOS development configuration\r\n" +
-            "# Keep this file local. Do not commit the client secret.\r\n" +
-            $"ProductId={DefaultProductId}\r\n" +
-            $"SandboxId={DefaultSandboxId}\r\n" +
-            $"DeploymentId={DefaultDeploymentId}\r\n" +
-            $"ClientId={DefaultClientId}\r\n" +
-            "ClientSecret=PASTE_TEMPORARY_SECRET_HERE\r\n");
-    }
 
     private static string Read(IReadOnlyDictionary<string, string> values, string key, string fallback)
         => values.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)
