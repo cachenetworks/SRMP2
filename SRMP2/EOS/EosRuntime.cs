@@ -361,9 +361,12 @@ internal sealed class EosRuntime : IDisposable
     {
         if (!IsLoggedIn)
         {
+            _log($"EOS JoinLobbyById refused locally for {code}: no logged-in Product User ID.");
             completion?.Invoke(EosNative.Result.InvalidUser, string.Empty);
             return;
         }
+
+        _log($"EOS JoinLobbyById request starting for {code}.");
 
         using var lobbyId = new EosUtf8(code);
         var options = new EosNative.JoinLobbyByIdOptions
@@ -379,9 +382,20 @@ internal sealed class EosRuntime : IDisposable
         _joinLobbyCallback = (ref EosNative.LobbyResultCallbackInfo data) =>
         {
             var id = EosNative.PtrToUtf8(data.LobbyId);
+            _log($"EOS JoinLobbyById callback for {code}: result={data.ResultCode}, lobby={id}.");
             completion?.Invoke(data.ResultCode, id);
         };
-        EosNative.EOS_Lobby_JoinLobbyById(_lobby, ref options, IntPtr.Zero, _joinLobbyCallback);
+
+        try
+        {
+            EosNative.EOS_Lobby_JoinLobbyById(_lobby, ref options, IntPtr.Zero, _joinLobbyCallback);
+            _log($"EOS JoinLobbyById request queued for {code}; waiting for EOS callback.");
+        }
+        catch (Exception ex)
+        {
+            _log($"EOS JoinLobbyById native call threw for {code}: {ex}");
+            completion?.Invoke(EosNative.Result.ServiceFailure, string.Empty);
+        }
     }
 
     internal bool TryGetLobbyOwner(string lobbyId, out IntPtr owner)
