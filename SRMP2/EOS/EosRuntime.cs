@@ -2,11 +2,14 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
+using SRMP2.Networking;
 
 namespace SRMP2.EOS;
 
 internal sealed class EosRuntime : IDisposable
 {
+    private static IntPtr _nativeLibraryHandle;
+
     private readonly Action<string> _log;
     private readonly List<Action<bool, string>> _loginWaiters = new();
     private readonly EosSocketId _socketId = new("SRMP2");
@@ -17,6 +20,7 @@ internal sealed class EosRuntime : IDisposable
     private IntPtr _p2p;
     private bool _loginInProgress;
     private bool _disposed;
+    private string _loginDisplayName = "Rancher";
 
     private EosNative.CreateDeviceIdCallback _createDeviceIdCallback;
     private EosNative.LoginCallback _loginCallback;
@@ -58,6 +62,8 @@ internal sealed class EosRuntime : IDisposable
 
         try
         {
+            EnsureNativeLibraryLoaded();
+
             using var productName = new EosUtf8("SRMP2");
             using var productVersion = new EosUtf8(BuildInfo.Version);
             var initializeOptions = new EosNative.InitializeOptions
@@ -96,7 +102,7 @@ internal sealed class EosRuntime : IDisposable
                     ClientSecret = clientSecret.Pointer
                 },
                 IsServer = 0,
-                Flags = 0x00002UL,
+                Flags = 0x00002UL, // EOS_PF_DISABLE_OVERLAY
                 CacheDirectory = cacheDir.Pointer,
                 TickBudgetInMilliseconds = 0
             };
@@ -118,12 +124,12 @@ internal sealed class EosRuntime : IDisposable
                 return false;
             }
 
-            var relay = new EosNative.SetRelayControlOptions
+            var relayOptions = new EosNative.SetRelayControlOptions
             {
                 ApiVersion = 1,
                 RelayControl = EosNative.RelayControl.AllowRelays
             };
-            var relayResult = EosNative.EOS_P2P_SetRelayControl(_p2p, ref relay);
+            var relayResult = EosNative.EOS_P2P_SetRelayControl(_p2p, ref relayOptions);
             if (relayResult != EosNative.Result.Success)
                 _log($"EOS relay configuration returned {relayResult}; direct P2P may still work.");
 
@@ -148,6 +154,29 @@ internal sealed class EosRuntime : IDisposable
             ReleasePlatform();
             return false;
         }
+    }
+
+    private static void EnsureNativeLibraryLoaded()
+    {
+        if (_nativeLibraryHandle != IntPtr.Zero)
+            return;
+
+        if (NativeLibrary.TryLoad(EosNative.LibraryName, out _nativeLibraryHandle))
+            return;
+
+        var gamePluginPath = Path.Combine(
+            AppContext.BaseDirectory,
+            "SlimeRancher2_Data",
+            "Plugins",
+            "x86_64",
+            EosNative.LibraryName);
+
+        if (File.Exists(gamePluginPath) && NativeLibrary.TryLoad(gamePluginPath, out _nativeLibraryHandle))
+            return;
+
+        // Let the following DllImport call raise the normal DllNotFoundException,
+        // which is converted into a useful SRMP2 status message by Initialize().
+        _nativeLibraryHandle = IntPtr.Zero;
     }
 
     internal void Tick()
@@ -175,7 +204,9 @@ internal sealed class EosRuntime : IDisposable
         if (_loginInProgress)
             return;
 
+        _loginDisplayName = Protocol.CleanUsername(displayName);
         _loginInProgress = true;
+
         using var deviceModel = new EosUtf8("PC Windows");
         var options = new EosNative.CreateDeviceIdOptions
         {
@@ -200,6 +231,7 @@ internal sealed class EosRuntime : IDisposable
 
     private void BeginDeviceLogin()
     {
+        using var displayName = new EosUtf8(_loginDisplayName);
         var credentials = new EosNative.ConnectCredentials
         {
             ApiVersion = 1,
@@ -209,7 +241,7 @@ internal sealed class EosRuntime : IDisposable
         var userInfo = new EosNative.UserLoginInfo
         {
             ApiVersion = 2,
-            DisplayName = IntPtr.Zero,
+            DisplayName = displayName.Pointer,
             NsaIdToken = IntPtr.Zero
         };
 
@@ -423,6 +455,7 @@ internal sealed class EosRuntime : IDisposable
     {
         if (!IsLoggedIn || string.IsNullOrWhiteSpace(lobbyId))
             return;
+
         using var id = new EosUtf8(lobbyId);
         var options = new EosNative.DestroyLobbyOptions
         {
@@ -430,7 +463,7 @@ internal sealed class EosRuntime : IDisposable
             LocalUserId = LocalUserId,
             LobbyId = id.Pointer
         };
-        _cleanupLobbyCallback ??= (ref EosNative.LobbyResultCallbackInfo _) => { };
+        _cleanupLobbyCallback ??= IgnoreLobbyCleanup;
         EosNative.EOS_Lobby_DestroyLobby(_lobby, ref options, IntPtr.Zero, _cleanupLobbyCallback);
     }
 
@@ -438,6 +471,7 @@ internal sealed class EosRuntime : IDisposable
     {
         if (!IsLoggedIn || string.IsNullOrWhiteSpace(lobbyId))
             return;
+
         using var id = new EosUtf8(lobbyId);
         var options = new EosNative.LeaveLobbyOptions
         {
@@ -445,8 +479,12 @@ internal sealed class EosRuntime : IDisposable
             LocalUserId = LocalUserId,
             LobbyId = id.Pointer
         };
-        _cleanupLobbyCallback ??= (ref EosNative.LobbyResultCallbackInfo _) => { };
+        _cleanupLobbyCallback ??= IgnoreLobbyCleanup;
         EosNative.EOS_Lobby_LeaveLobby(_lobby, ref options, IntPtr.Zero, _cleanupLobbyCallback);
+    }
+
+    private static void IgnoreLobbyCleanup(ref EosNative.LobbyResultCallbackInfo data)
+    {
     }
 
     internal void RegisterP2PCallbacks(Action<IntPtr> connectionRequest, Action<IntPtr, int> connectionClosed)
@@ -480,6 +518,9 @@ internal sealed class EosRuntime : IDisposable
 
     internal EosNative.Result AcceptConnection(IntPtr remoteUserId)
     {
+        if (!IsLoggedIn || remoteUserId == IntPtr.Zero)
+            return EosNative.Result.InvalidParameters;
+
         var options = new EosNative.AcceptConnectionOptions
         {
             ApiVersion = 1,
@@ -494,6 +535,7 @@ internal sealed class EosRuntime : IDisposable
     {
         if (!IsLoggedIn || remoteUserId == IntPtr.Zero)
             return EosNative.Result.InvalidParameters;
+
         var options = new EosNative.CloseConnectionOptions
         {
             ApiVersion = 1,
@@ -504,7 +546,12 @@ internal sealed class EosRuntime : IDisposable
         return EosNative.EOS_P2P_CloseConnection(_p2p, ref options);
     }
 
-    internal EosNative.Result Send(IntPtr remoteUserId, byte channel, byte[] data, EosNative.PacketReliability reliability, bool disableAutoAccept = true)
+    internal EosNative.Result Send(
+        IntPtr remoteUserId,
+        byte channel,
+        byte[] data,
+        EosNative.PacketReliability reliability,
+        bool disableAutoAccept = true)
     {
         if (!IsLoggedIn || remoteUserId == IntPtr.Zero || data == null || data.Length == 0)
             return EosNative.Result.InvalidParameters;
@@ -555,10 +602,14 @@ internal sealed class EosRuntime : IDisposable
         if (sizeResult != EosNative.Result.Success || packetSize == 0 || packetSize > EosNative.MaxP2PPacketSize)
             return false;
 
-        var buffer = new byte[packetSize];
+        var buffer = new byte[(int)packetSize];
         var socketBuffer = Marshal.AllocHGlobal(sizeof(int) + 33);
         try
         {
+            for (var i = 0; i < sizeof(int) + 33; i++)
+                Marshal.WriteByte(socketBuffer, i, 0);
+            Marshal.WriteInt32(socketBuffer, 0, 1); // EOS_P2P_SOCKETID_API_LATEST
+
             var receiveOptions = new EosNative.ReceivePacketOptions
             {
                 ApiVersion = 2,
@@ -577,8 +628,11 @@ internal sealed class EosRuntime : IDisposable
 
             if (receiveResult != EosNative.Result.Success || remoteUserId == IntPtr.Zero || bytesWritten == 0)
                 return false;
+            if (bytesWritten > buffer.Length)
+                return false;
             if (bytesWritten != buffer.Length)
                 Array.Resize(ref buffer, (int)bytesWritten);
+
             data = buffer;
             return true;
         }
@@ -592,6 +646,7 @@ internal sealed class EosRuntime : IDisposable
     {
         if (_p2p == IntPtr.Zero)
             return;
+
         if (_connectionRequestNotification != EosNative.InvalidNotificationId)
         {
             EosNative.EOS_P2P_RemoveNotifyPeerConnectionRequest(_p2p, _connectionRequestNotification);
@@ -611,6 +666,7 @@ internal sealed class EosRuntime : IDisposable
         _connect = IntPtr.Zero;
         _lobby = IntPtr.Zero;
         _p2p = IntPtr.Zero;
+
         if (_platform != IntPtr.Zero)
         {
             EosNative.EOS_Platform_Release(_platform);
@@ -622,9 +678,12 @@ internal sealed class EosRuntime : IDisposable
     {
         if (_disposed)
             return;
+
         _disposed = true;
         ReleasePlatform();
         _socketId.Dispose();
+
         // Never call EOS_Shutdown here: Slime Rancher 2 itself also uses EOS.
+        // Do not free _nativeLibraryHandle either; the game may share that module.
     }
 }
