@@ -21,7 +21,7 @@ internal sealed class RemotePlayer
     {
         Peer = peer;
         _root = new GameObject($"SRMP2 Remote - {peer.Username} ({peer.Id})");
-        Object.DontDestroyOnLoad(_root);
+        UnityEngine.Object.DontDestroyOnLoad(_root);
 
         var body = GameObject.CreatePrimitive(PrimitiveType.Capsule);
         body.name = "Body";
@@ -114,7 +114,7 @@ internal sealed class RemotePlayer
     internal void Destroy()
     {
         if (_root != null)
-            Object.Destroy(_root);
+            UnityEngine.Object.Destroy(_root);
     }
 
     private static bool IsSequenceNewer(ushort candidate, ushort previous)
